@@ -267,40 +267,59 @@ class Landscape {
       pts.push(row);
     }
 
-    ctx.lineWidth = Math.max(1, 1.1 * this.dpr);
-    ctx.strokeStyle = rgbArrToStr(theme.line);
-    ctx.shadowColor = rgbArrToStr(theme.glow);
-    ctx.shadowBlur = (6 + energy * 18) * this.dpr;
-    ctx.globalAlpha = 0.9;
+    // Performance note: an earlier version used ctx.shadowBlur (native
+    // canvas shadows are a full per-pixel blur, one of the single most
+    // expensive canvas-2D operations) *and* stroked every column segment
+    // individually to get a per-vertex depth fade -- ~1000+ stroke() calls
+    // a frame, each paying the shadow-blur cost. Measured: ~12fps on a
+    // retina display. Fixed two ways: (1) depth-fade is bucketed into a
+    // handful of BANDS, each drawn as one multi-subpath stroke() call
+    // instead of one call per row/segment; (2) the glow is now a cheap
+    // second wide/dim stroke pass instead of native shadowBlur.
+    const BANDS = 6;
+    const bandOf = (r) => Math.min(BANDS - 1, Math.floor((r / rows) * BANDS));
+    const bandAlpha = (b) => 0.15 + (1 - b / (BANDS - 1)) * 0.75;
 
-    // Depth-fade: far rows drawn fainter so the grid dissolves into the
-    // background instead of hard-clipping at the horizon.
-    for (let r = 0; r < rows; r++) {
-      const fade = 1 - r / rows;
-      ctx.globalAlpha = 0.15 + fade * 0.75;
-      ctx.beginPath();
-      for (let c = 0; c < cols; c++) {
-        const [sx, sy] = pts[r][c];
-        if (c === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
-      }
-      ctx.stroke();
-    }
-    // Drawn one segment at a time (not a single multi-vertex path): canvas
-    // applies globalAlpha at stroke() time, uniformly across the whole
-    // current path, so a per-vertex fade only works if each faded segment
-    // gets its own beginPath/stroke call.
-    for (let c = 0; c < cols; c++) {
-      for (let r = 0; r < rows - 1; r++) {
-        const fade = 1 - r / rows;
-        ctx.globalAlpha = 0.15 + fade * 0.75;
+    const strokeLayer = (lineWidth, alphaMul) => {
+      ctx.lineWidth = lineWidth;
+      // Rows: one path per band, each row in that band as its own subpath.
+      for (let b = 0; b < BANDS; b++) {
+        ctx.globalAlpha = bandAlpha(b) * alphaMul;
         ctx.beginPath();
-        ctx.moveTo(pts[r][c][0], pts[r][c][1]);
-        ctx.lineTo(pts[r + 1][c][0], pts[r + 1][c][1]);
+        for (let r = 0; r < rows; r++) {
+          if (bandOf(r) !== b) continue;
+          for (let c = 0; c < cols; c++) {
+            const [sx, sy] = pts[r][c];
+            if (c === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+          }
+        }
         ctx.stroke();
       }
-    }
+      // Columns: one path per band, each column's run of rows within that
+      // band as its own subpath (rows in a band are contiguous, so this is
+      // a single connected polyline per column per band).
+      for (let b = 0; b < BANDS; b++) {
+        ctx.globalAlpha = bandAlpha(b) * alphaMul;
+        ctx.beginPath();
+        for (let c = 0; c < cols; c++) {
+          let started = false;
+          for (let r = 0; r < rows; r++) {
+            if (bandOf(r) !== b) { started = false; continue; }
+            const [sx, sy] = pts[r][c];
+            if (!started) { ctx.moveTo(sx, sy); started = true; } else { ctx.lineTo(sx, sy); }
+          }
+        }
+        ctx.stroke();
+      }
+    };
+
+    ctx.strokeStyle = rgbArrToStr(theme.line);
+    // Cheap glow substitute: a wider, dimmer pass underneath the crisp
+    // line, brightened a little with the audio's energy -- no shadowBlur.
+    strokeLayer((3.2 + energy * 2.5) * this.dpr, 0.22 + energy * 0.18);
+    strokeLayer(Math.max(1, 1.1 * this.dpr), 0.9);
+
     ctx.globalAlpha = 1;
-    ctx.shadowBlur = 0;
   }
 }
 
