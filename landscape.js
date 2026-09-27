@@ -34,6 +34,28 @@
 // theme's shapes (see _retheme) so the cut reads as a new world right
 // when the theme name does, rather than waiting on the slow natural
 // reshape cadence.
+//
+// Two more things read directly from the track's own data, not just live
+// signal analysis:
+//  - Tempo: every track carries a BPM. A beat clock (beatCount/beatPhase)
+//    is derived straight from audioEl.currentTime * bpm/60 -- real musical
+//    time, not the motion clock -- and the pool's reshape/explosion
+//    events + the camera's focus changes are quantized to it (each object
+//    reshapes on its own beat-multiple, staggered across the pool; focus
+//    changes every 2 bars), so the big visual changes land ON the beat.
+//    The shared motion clock's own rate is additionally scaled by
+//    bpm/110, so a fast track feels more urgent throughout, not only at
+//    the quantized events.
+//  - Spectrum: each object's own wireframe is continuously displaced
+//    along its own vertex-from-center direction by a 64-band log-spaced
+//    FFT texture (see OBJECT_VS/uFFT) -- so the actual shape of every
+//    polyhedron is sculpted by the music's real spectral content every
+//    frame, not just its 3-band bass/mid/treble energy average. A slow
+//    real-time UV drift keeps the same audio from always deforming the
+//    same vertices, so it never settles into a static "ready position".
+//  - Onsets additionally reroll a random subset of the pool's spin
+//    vectors each hit, so rotation direction/speed keeps changing instead
+//    of grinding on in one fixed direction all track.
 
 // Index into SHAPE_KINDS: 0 ico, 1 dodeca, 2 octa, 3 tetra, 4 torus,
 // 5 torusKnot, 6 box, 7 cone, 8 sphere, 9 cylinder, 10 ring. Each theme
@@ -80,6 +102,8 @@ const ONSET_RATIO = 1.32;
 const ONSET_REFRACTORY_S = 0.14;
 const FOCUS_AHEAD = 46;      // world units the camera's orbit pivot sits ahead of the flight position
 const ORBIT_RATE = 0.8;      // camera orbit angular speed per motion-clock unit
+const FOCUS_BEATS = 8;       // camera cuts to a new focus object every 2 bars (4/4 assumed)
+const REF_BPM = 110;         // reference tempo the base motion rate is tuned around
 
 const FLOOR_VS = `
   uniform float uTime;
@@ -110,14 +134,29 @@ const LINE_FS = `
     gl_FragColor = vec4(mix(uColor, uFog, clamp(fog, 0.0, 1.0)), 1.0);
   }
 `;
-// Same fog treatment for ordinary (non-shader-displaced) LineSegments
-// objects -- a plain onBeforeCompile-free approach: a tiny custom material
-// reusing the same fragment shader, fed a flat vertex shader.
-const PLAIN_VS = `
+// Object wireframes: same fog treatment as the floor, plus the actual
+// "geometry shifts with the audio analysis" mechanism. Each vertex is
+// pushed out along its own direction from the object's center (a
+// perfectly good pseudo-normal for a shape centered at the origin) by an
+// amount sampled from a 64-band FFT texture -- and *which* band a given
+// vertex samples depends on its own angle/radius around the shape, so
+// different parts of the same polyhedron visibly respond to different
+// parts of the spectrum. uTime drifts that sampling slowly in real time
+// so a repeated audio snapshot doesn't always deform the same vertices.
+const OBJECT_VS = `
+  uniform sampler2D uFFT;
+  uniform float uDeform;
+  uniform float uTime;
   varying float vDist;
   void main() {
-    vDist = length((modelViewMatrix * vec4(position, 1.0)).xyz);
-    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    float len = length(position) + 0.0001;
+    vec3 dir = position / len;
+    float ang = atan(position.z, position.x);
+    float uvCoord = fract(ang * 0.15915 + len * 0.02 + uTime * 0.015);
+    float mag = texture2D(uFFT, vec2(uvCoord, 0.5)).r;
+    vec3 displaced = position + dir * mag * uDeform;
+    vDist = length((modelViewMatrix * vec4(displaced, 1.0)).xyz);
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(displaced, 1.0);
   }
 `;
 
@@ -181,6 +220,23 @@ class Landscape {
 
     this.focusObj = null;
     this.focusRetargetAt = 0;
+    this.lastFocusBeat = -FOCUS_BEATS;
+
+    // Beat clock, derived from the track's own BPM + real playback time
+    // (not the motion clock) -- see header comment.
+    this.beatCount = 0;
+    this.beatPhase = 0;
+
+    // 64-band log-spaced FFT texture sampled by OBJECT_VS to deform every
+    // wireframe's actual vertices. Built once; only its contents change
+    // (see _updateAudioFeatures), so no material ever needs to reassign
+    // the texture reference itself.
+    this.FFT_TEX_BINS = 64;
+    this.fftArray = new Float32Array(this.FFT_TEX_BINS);
+    this.fftTexture = new THREE.DataTexture(this.fftArray, this.FFT_TEX_BINS, 1, THREE.RedFormat, THREE.FloatType);
+    this.fftTexture.magFilter = THREE.LinearFilter;
+    this.fftTexture.minFilter = THREE.LinearFilter;
+    this.fftTexture.needsUpdate = true;
 
     this.track = null;
     this.sectionStarts = [];
@@ -217,8 +273,8 @@ class Landscape {
 
     this.objectMat = new THREE.ShaderMaterial({
       uniforms: { uColor: { value: new THREE.Color(0xffffff) }, uFog: { value: new THREE.Color(0x000000) },
-        uFogDensity: { value: 0.00006 } },
-      vertexShader: PLAIN_VS, fragmentShader: LINE_FS,
+        uFogDensity: { value: 0.00006 }, uFFT: { value: this.fftTexture }, uDeform: { value: 1.1 }, uTime: { value: 0 } },
+      vertexShader: OBJECT_VS, fragmentShader: LINE_FS,
     });
 
     this.objects = [];
@@ -263,13 +319,13 @@ class Landscape {
   }
 
   // Each object gets one of four independent wander behaviors for
-  // positional variety, PLUS -- independent of that -- its own "dance"
-  // cycle (cycleLen/cycleOffset/lastCycleIdx): a fixed-amplitude,
-  // motionT-paced loop of continuous rotation, a periodic reshape into a
-  // fresh form, and a quick scale-burst around each reshape. Both are
-  // fixed-amplitude functions of the shared clock -- never audio
-  // amplitude directly -- so the music's energy only ever changes how
-  // fast the loop plays, not how far anything swings.
+  // positional variety, PLUS -- independent of that -- its own "dance":
+  // continuous rotation, and a reshape-with-scale-burst quantized to its
+  // own beat multiple (beatPeriod/beatOffset/lastReshapeBeat) so it lands
+  // precisely on the track's actual tempo grid, staggered across the pool
+  // so objects don't all pop on the same beat. Rotation and wander stay
+  // fixed-amplitude functions of the motion clock -- the reshape is what's
+  // locked to musical time instead.
   _makeObject(randomizeZ, theme) {
     const kind = pickShapeKind(theme);
     const radius = 4 + Math.random() * 9;
@@ -290,11 +346,12 @@ class Landscape {
       swayAmp: 8 + Math.random() * 16,
       swayRate: 0.08 + Math.random() * 0.22,
       spin: new THREE.Vector3((Math.random() - 0.5) * 5, (Math.random() - 0.5) * 5, (Math.random() - 0.5) * 5),
-      cycleLen: 1.3 + Math.random() * 2.4,
-      cycleOffset: Math.random(),
-      lastCycleIdx: 0,
+      beatPeriod: [2, 4, 8][(Math.random() * 3) | 0],
+      beatOffset: 0,
+      lastReshapeBeat: -1,
       orbitCamR: 24 + Math.random() * 16,
     };
+    mesh.userData.beatOffset = (Math.random() * mesh.userData.beatPeriod) | 0;
     mesh.position.set(baseX, mesh.userData.baseY,
       -(randomizeZ ? Math.random() * OBJECT_SPAN : 0));
     this.scene.add(mesh);
@@ -432,7 +489,41 @@ class Landscape {
       this._spawnEvent();
       if (strength > 0.55) this._spawnEvent();
       if (strength > 0.85) this._spawnEvent();
+      // Reroll a random subset of the pool's rotation vectors on every
+      // hit -- distinct from the beat-quantized reshape below, this is
+      // what keeps rotation itself from ever settling into one fixed,
+      // "just spinning" direction/speed for the whole track.
+      for (const o of this.objects) {
+        if (Math.random() < 0.35) {
+          o.userData.spin.set((Math.random() - 0.5) * 6, (Math.random() - 0.5) * 6, (Math.random() - 0.5) * 6);
+        }
+      }
     }
+
+    // Full-spectrum, log-frequency-spaced deformation texture: every
+    // wireframe's own vertex shader (OBJECT_VS) samples this, so the
+    // actual shape of every object is continuously sculpted by the real
+    // spectral content, not just the coarse 3-band energy above.
+    const sampleRate = (this.audioCtx && this.audioCtx.sampleRate) || 44100;
+    const nyquist = sampleRate / 2;
+    let peak = 0;
+    for (let i = 0; i < n; i++) if (this.freqData[i] > peak) peak = this.freqData[i];
+    if (peak > 6) {
+      const logMin = Math.log2(40), logMax = Math.log2(9000);
+      for (let kIdx = 0; kIdx < this.FFT_TEX_BINS; kIdx++) {
+        const t = kIdx / (this.FFT_TEX_BINS - 1);
+        const freq = Math.pow(2, logMin + t * (logMax - logMin));
+        const binIdx = Math.min(n - 1, Math.floor((freq / nyquist) * n));
+        // Temporally smoothed (blended toward the new reading rather than
+        // snapped to it) so the deformation flows/breathes with the sound
+        // instead of flickering to a new noise pattern every frame.
+        const raw = this.freqData[binIdx] / 255;
+        this.fftArray[kIdx] += (raw - this.fftArray[kIdx]) * 0.3;
+      }
+    } else {
+      for (let kIdx = 0; kIdx < this.FFT_TEX_BINS; kIdx++) this.fftArray[kIdx] *= 0.85;
+    }
+    this.fftTexture.needsUpdate = true;
   }
 
   // Each audio "event" punches out a wireframe polyhedron near the flight
@@ -448,8 +539,8 @@ class Landscape {
     const radius = 2 + Math.random() * 2.5;
     const mat = new THREE.ShaderMaterial({
       uniforms: { uColor: { value: new THREE.Color(theme.glow) }, uFog: { value: new THREE.Color(theme.bg) },
-        uFogDensity: { value: 0.00006 } },
-      vertexShader: PLAIN_VS, fragmentShader: LINE_FS, transparent: true,
+        uFogDensity: { value: 0.00006 }, uFFT: { value: this.fftTexture }, uDeform: { value: 0.8 }, uTime: { value: 0 } },
+      vertexShader: OBJECT_VS, fragmentShader: LINE_FS, transparent: true,
     });
     const mesh = new THREE.LineSegments(makeShapeGeometry(kind, radius), mat);
     mesh.frustumCulled = false;
@@ -491,21 +582,36 @@ class Landscape {
     const dt = Math.min(0.05, (now - this.lastFrameTime) / 1000);
     this.lastFrameTime = now;
 
+    const currentTime = (this.audioEl && this.track) ? (this.audioEl.currentTime || 0) : 0;
     if (this.audioEl && this.track && !this.audioEl.paused) {
-      this._maybeSwitchSection(this.audioEl.currentTime || 0);
+      this._maybeSwitchSection(currentTime);
     }
     this._updateAudioFeatures(dt);
     if (this.themeBlend < 1) this.themeBlend = Math.min(1, (now - this.themeBlendStart) / 1200);
     const theme = this._blendedThemeSnapshot();
 
-    // The only place live audio energy touches anything: how fast the
-    // shared motion clock runs. Everything else below reads its phase
-    // from motionT/dMotion at fixed amplitude.
+    // Tempo: a beat clock derived straight from the track's own BPM and
+    // real playback position, independent of the motion clock -- see
+    // header comment. Falls back to a plausible default before a track's
+    // BPM is known so nothing divides by zero.
+    const bpm = (this.track && this.track.bpm) || REF_BPM;
+    const beatSec = 60 / bpm;
+    this.beatCount = Math.floor(currentTime / beatSec);
+    this.beatPhase = currentTime / beatSec - this.beatCount;
+
+    // The only place live audio energy touches anything continuous: how
+    // fast the shared motion clock runs -- additionally scaled by tempo,
+    // so a fast track feels more urgent throughout. Everything below
+    // reads its phase from motionT/dMotion at fixed amplitude.
     const energy = this.bass * 0.6 + this.mid * 0.3 + this.treble * 0.1;
-    const motionRate = 0.35 + energy * 1.7 + this.designedIntensity * 0.25;
+    const bpmRatio = bpm / REF_BPM;
+    const motionRate = (0.35 + energy * 1.7 + this.designedIntensity * 0.25) * bpmRatio;
     const dMotion = dt * motionRate;
     this.motionT += dMotion;
     this.flightDist += dMotion * 46;
+
+    this.objectMat.uniforms.uTime.value = now / 1000;
+    this.objectMat.uniforms.uDeform.value = 0.9 + this.designedIntensity * 1.0;
 
     this._updateWorld(dt, dMotion, theme, energy);
     this._render(theme);
@@ -514,6 +620,7 @@ class Landscape {
   _updateWorld(dt, dMotion, theme, energy) {
     const cam = this.camera;
     const motionT = this.motionT;
+    const beatCount = this.beatCount, beatPhase = this.beatPhase;
 
     // Camera: a literal orbit around whichever object is currently in
     // focus, re-aimed with lookAt every frame -- never a self-roll/bank
@@ -522,13 +629,13 @@ class Landscape {
     // "focus" and "push forward" and "round" all happen at once: the
     // camera circles a subject that is itself continuously advancing.
     const pivotZ = -this.flightDist - FOCUS_AHEAD;
-    if (!this.focusObj || motionT > this.focusRetargetAt) {
+    if (!this.focusObj || beatCount - this.lastFocusBeat >= FOCUS_BEATS) {
       this.focusObj = this._pickFocusObject();
       const u = this.focusObj.userData;
       u.centerX = (Math.random() - 0.5) * 26;
       u.baseX = u.centerX;
       u.orbitCamR = 22 + Math.random() * 16;
-      this.focusRetargetAt = motionT + 2.4 + Math.random() * 1.8;
+      this.lastFocusBeat = beatCount;
     }
     const focus = this.focusObj;
     const R = focus.userData.orbitCamR;
@@ -571,19 +678,21 @@ class Landscape {
         o.position.y = u.baseY + Math.sin(motionT * u.bobRate + u.bobPhase) * u.bobAmp;
       }
 
-      // The dance cycle: purely a function of motionT, so it needs no
-      // per-hit trigger or spring state. Crossing into a new cycle count
-      // reshapes the object; a short window right after that is a smooth
-      // scale-burst "explosion" -- rotate, change shape, reset, repeat.
-      const cycleVal = motionT / u.cycleLen + u.cycleOffset;
-      const cycleIdx = Math.floor(cycleVal);
-      const cyclePos = cycleVal - cycleIdx;
-      if (cycleIdx !== u.lastCycleIdx) {
-        u.lastCycleIdx = cycleIdx;
+      // The dance's reshape/explosion is quantized to this object's own
+      // beat multiple (staggered via beatOffset so the pool doesn't all
+      // pop on the same beat) -- landing precisely on the track's real
+      // tempo grid, per the "more clearly linked to tempo" ask, rather
+      // than an arbitrary internally-timed cycle. The scale-burst envelope
+      // is likewise measured in beats-since-triggered, not motionT.
+      if (beatCount >= 0 && (beatCount - u.beatOffset) % u.beatPeriod === 0 && beatCount !== u.lastReshapeBeat) {
+        u.lastReshapeBeat = beatCount;
         this._reshapeObject(o, theme);
+        const behaviors = ['bob', 'orbit', 'sway', 'still'];
+        u.behavior = behaviors[(Math.random() * behaviors.length) | 0];
       }
-      const burstWindow = 0.18;
-      o.scale.setScalar(cyclePos < burstWindow ? 1 + Math.sin((cyclePos / burstWindow) * Math.PI) * 0.8 : 1);
+      const beatsSinceReshape = (beatCount - u.lastReshapeBeat) + beatPhase;
+      const burstWindow = 0.35;
+      o.scale.setScalar(beatsSinceReshape < burstWindow ? 1 + Math.sin(Math.min(1, beatsSinceReshape / burstWindow) * Math.PI) * 0.8 : 1);
 
       if (o === focus) {
         // Pinned to the advancing orbit pivot instead of the ordinary
