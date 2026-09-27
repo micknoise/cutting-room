@@ -34,7 +34,17 @@
   function loadTrack(idx, doPlay) {
     current = ((idx % TRACKS.length) + TRACKS.length) % TRACKS.length;
     var t = TRACKS[current];
-    player.src = t.path;
+    // Re-assigning .src (even to the same URL) makes the element reload
+    // from scratch, restarting playback at 0 -- a real bug this caused:
+    // pressing the *native* play button fires our 'play' listener, which
+    // calls loadTrack(current, true) for the track that was already
+    // loaded and had just started playing, immediately restarting it.
+    // Comparing against the resolved absolute URL (reading .src back
+    // always gives the absolute form, even when it was set with a
+    // relative path) makes this a no-op when the right track is already
+    // loaded.
+    var resolved = new URL(t.path, window.location.href).href;
+    if (player.src !== resolved) player.src = t.path;
     select.value = String(current);
     renderNowPlaying(t);
     landscape.setTrack(t);
@@ -63,7 +73,6 @@
   function begin() {
     if (started) return;
     started = true;
-    landscape.bindAudio(player);
     landscape.resumeAudio();
     startHint.setAttribute('hidden', '');
     loadTrack(current, true);
@@ -72,6 +81,22 @@
   populateTrackSelect();
   renderNowPlaying(TRACKS[0]);
   landscape.setTrack(TRACKS[0]);
+  // Two real bugs, both here:
+  // 1) The native <audio> element had no `src` at all until begin()/
+  //    loadTrack() ran, so the browser correctly greyed out its own play
+  //    button (there was nothing to play) until a track was picked from
+  //    the dropdown, which is what actually called loadTrack.
+  // 2) bindAudio() (which calls createMediaElementSource -- allowed any
+  //    time, no gesture needed) used to run lazily *inside* begin(), i.e.
+  //    inside the 'play' event handler fired by the very play() call that
+  //    triggered it. Rewiring the element's audio graph while a play()
+  //    promise from that same call was still settling raced it: Chrome
+  //    aborted the play() with "interrupted by a new load request".
+  // Fix: point at track 0 and bind the audio graph immediately on load
+  // (both gesture-free), and leave only audioCtx.resume() -- the one part
+  // that genuinely needs a user gesture -- for begin().
+  player.src = TRACKS[0].path;
+  landscape.bindAudio(player);
 
   startHint.addEventListener('click', begin);
   document.addEventListener('keydown', function (e) {
@@ -80,7 +105,6 @@
 
   select.addEventListener('change', function () {
     started = true; // picking a track from the list is itself the user gesture
-    landscape.bindAudio(player);
     landscape.resumeAudio();
     startHint.setAttribute('hidden', '');
     loadTrack(parseInt(select.value, 10), true);

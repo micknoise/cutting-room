@@ -1,32 +1,33 @@
-// Wireframe landscape: a plain canvas-2D perspective grid whose terrain is
-// a sum of a handful of travelling sine waves (cheap, dependency-free, and
-// visually organic enough -- no noise library needed). The camera-space
-// grid positions are fixed; only the *sampling coordinate* fed into the
-// height function scrolls forward each frame, so the terrain flows toward
-// the viewer forever with no wrap-around seam.
+// Wireframe landscape, WebGL edition. Two things happen every frame:
+//  1. A perspective wireframe terrain grid (heightmap = a sum of travelling
+//     sine waves -- cheap, dependency-free, no noise library) scrolls
+//     toward the viewer forever.
+//  2. Audio "events" (onsets detected from the bass band -- a fast/slow
+//     energy envelope crossing a threshold) each punch out a expanding
+//     wireframe ring entity that grows, rotates and fades.
+// Both are just line segments -- the whole scene is ONE gl.LINES draw call
+// a frame. Motion trails are a GPU feedback effect (ping-pong framebuffers:
+// each frame, the previous frame's texture is faded toward the theme
+// background and the new lines are drawn additively on top), not a
+// per-object fade, so it's essentially free.
 //
-// Two independent inputs drive it:
-//   - the piece's own composed arc (per-section `intensity` from the
-//     generator's own JSON report) -- a slow, designed "journey" through
-//     the landscape's scale/energy that has nothing to do with the raw
-//     waveform, so it stays meaningful even in a quiet passage.
-//   - live Web Audio analysis of the actual sound (bass/mid/treble energy)
-//     -- the fast, reactive detail that keeps it locked to what's audible
-//     right now.
-// A "theme" (palette + terrain shape) is picked per song-form letter (the
-// generator's own repeat-section identity -- same letter, same landscape)
-// and cross-fades in over ~1.2s whenever the section changes.
+// Two inputs drive the terrain: the piece's own composed per-section
+// `intensity` (a slow "designed journey") and live Web Audio frequency
+// analysis of the actual sound (fast bass/mid/treble reactivity). A
+// "theme" (palette + terrain shape) is picked per song-form letter and
+// cross-fades in over ~1.2s whenever the section changes, so a repeated
+// letter always gets the same landscape.
 
 const THEMES = [
-  { name: 'Dunes', bg: '#0b0906', line: '#c9a869', glow: '#7a5a2c',
+  { name: 'Dunes', bg: '#0a0a0d', line: '#9099c9', glow: '#4a5080',
     octaves: [[0.05, 0.9, 0.6], [0.11, 0.35, -0.9], [0.021, 1.6, 0.25]], shape: 'identity', base: 0.0 },
   { name: 'Crystal Peaks', bg: '#070a0d', line: '#bfe3e0', glow: '#3f7f78',
     octaves: [[0.07, 1.1, 0.5], [0.16, 0.6, -0.7], [0.033, 0.8, 0.3]], shape: 'abs', base: 0.15 },
-  { name: 'Deep Canyon', bg: '#0a0708', line: '#b46a55', glow: '#6e2f22',
+  { name: 'Deep Canyon', bg: '#0a0810', line: '#a37fc9', glow: '#4a3560',
     octaves: [[0.045, 1.3, 0.4], [0.09, 0.5, 0.8], [0.02, 0.7, -0.2]], shape: 'negabs', base: -0.1 },
   { name: 'Frozen Ridge', bg: '#080a0c', line: '#9fc4d6', glow: '#3a5566',
     octaves: [[0.06, 0.7, 0.35], [0.13, 0.45, -0.55], [0.028, 1.1, 0.15]], shape: 'identity', base: 0.05 },
-  { name: 'Ember Fields', bg: '#0a0705', line: '#d98a4a', glow: '#7a3413',
+  { name: 'Dusk Fields', bg: '#0a0810', line: '#b98aa0', glow: '#5c3648',
     octaves: [[0.08, 0.5, 0.7], [0.19, 0.3, -1.0], [0.04, 0.9, 0.4]], shape: 'abs', base: 0.0 },
   { name: 'Still Water', bg: '#06090a', line: '#7fa89e', glow: '#294844',
     octaves: [[0.03, 1.4, 0.2], [0.065, 0.5, 0.35], [0.14, 0.15, -0.6]], shape: 'identity', base: -0.05 },
@@ -39,16 +40,6 @@ function shapeHeight(kind, v) {
 }
 
 function lerp(a, b, t) { return a + (b - a) * t; }
-// Accepts either a "#rrggbb" hex string or an already-parsed [r,g,b] array
-// and always returns [r,g,b] -- theme colors are carried as arrays through
-// every blend step (see _currentBlendedTheme) and only turned into a CSS
-// "rgb(...)" string at the point of actually drawing. A real bug this used
-// to have: blending fed its own *string* output back in as the next
-// blend's starting color, and re-parsing "rgb(10,11,16)" as if it were hex
-// silently produced NaN for the red channel (parseInt("rg", 16) stops at
-// the first non-hex-digit character and returns NaN) -- so every color
-// after the first section change was invisible (an invalid CSS color is
-// silently ignored, not an error).
 function toRgbArr(color) {
   if (Array.isArray(color)) return color;
   const h = color.replace('#', '');
@@ -57,9 +48,6 @@ function toRgbArr(color) {
 function rgbLerpArr(colorA, colorB, t) {
   const a = toRgbArr(colorA), b = toRgbArr(colorB);
   return [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)];
-}
-function rgbArrToStr(arr) {
-  return `rgb(${Math.round(arr[0])},${Math.round(arr[1])},${Math.round(arr[2])})`;
 }
 
 // A small deterministic string hash -> picks the same theme for the same
@@ -72,18 +60,108 @@ function hashStr(s) {
   return Math.abs(h);
 }
 
+function compileShader(gl, type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(sh);
+    gl.deleteShader(sh);
+    throw new Error('shader compile failed: ' + log);
+  }
+  return sh;
+}
+function linkProgram(gl, vsSrc, fsSrc) {
+  const vs = compileShader(gl, gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl, gl.FRAGMENT_SHADER, fsSrc);
+  const prog = gl.createProgram();
+  gl.attachShader(prog, vs);
+  gl.attachShader(prog, fs);
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    const log = gl.getProgramInfoLog(prog);
+    throw new Error('program link failed: ' + log);
+  }
+  return prog;
+}
+
+const LINE_VS = `
+  attribute vec2 aPos;
+  attribute vec3 aColor;
+  attribute float aAlpha;
+  uniform vec2 uResolution;
+  varying vec3 vColor;
+  varying float vAlpha;
+  void main() {
+    vec2 clip = (aPos / uResolution) * 2.0 - 1.0;
+    clip.y = -clip.y;
+    gl_Position = vec4(clip, 0.0, 1.0);
+    vColor = aColor;
+    vAlpha = aAlpha;
+  }
+`;
+const LINE_FS = `
+  precision mediump float;
+  varying vec3 vColor;
+  varying float vAlpha;
+  void main() {
+    gl_FragColor = vec4(vColor * vAlpha, vAlpha);
+  }
+`;
+const QUAD_VS = `
+  attribute vec2 aPos;
+  varying vec2 vUv;
+  void main() {
+    vUv = aPos * 0.5 + 0.5;
+    gl_Position = vec4(aPos, 0.0, 1.0);
+  }
+`;
+// Simple GLSL blend: mixes the previous frame's texture toward the theme
+// background colour by uDecay each frame (the trail/persistence effect --
+// a cheap GPU feedback loop instead of per-object fade bookkeeping).
+const QUAD_FS = `
+  precision mediump float;
+  varying vec2 vUv;
+  uniform sampler2D uTex;
+  uniform float uDecay;
+  uniform vec3 uBg;
+  void main() {
+    vec3 c = texture2D(uTex, vUv).rgb;
+    gl_FragColor = vec4(mix(uBg, c, uDecay), 1.0);
+  }
+`;
+
+// A ring entity template (unit circle, N segments) -- each spawned entity
+// is just a transform (center, scale, rotation) applied to these points at
+// draw time, so spawning one costs nothing beyond a small object push.
+const RING_SEGMENTS = 22;
+const RING_PTS = [];
+for (let i = 0; i < RING_SEGMENTS; i++) {
+  const a = (i / RING_SEGMENTS) * Math.PI * 2;
+  RING_PTS.push([Math.cos(a), Math.sin(a)]);
+}
+
+const ENTITY_LIFETIME_S = 0.85;
+// Onset detection: a fast envelope (~instant) vs a slow one (~0.5s) on the
+// bass band -- an "event" fires when fast pulls far enough ahead of slow,
+// with a short refractory window so one hit can't retrigger mid-attack.
+const ONSET_RATIO = 1.32;
+const ONSET_REFRACTORY_S = 0.16;
+
 class Landscape {
   constructor(canvas) {
     this.canvas = canvas;
-    this.ctx = canvas.getContext('2d');
+    this.gl = canvas.getContext('webgl', { antialias: true, alpha: false });
     this.audioEl = null;
     this.audioCtx = null;
     this.analyser = null;
     this.freqData = null;
-    this.bass = 0; this.mid = 0; this.treble = 0; // smoothed 0..1 energy
-    this.t0 = performance.now();
+    this.bass = 0; this.mid = 0; this.treble = 0;
+    this.bassFast = 0; this.bassSlow = 0;
+    this.lastSpawn = -Infinity;
+    this.entities = [];
+    this.lastFrameTime = performance.now();
     this.scrollZ = 0;
-    this.lastFrameTime = this.t0;
 
     this.track = null;
     this.sectionStarts = [];
@@ -95,21 +173,82 @@ class Landscape {
     this.themeBlendStart = 0;
     this.designedIntensity = 0.4;
 
+    this._initGL();
     this._resize();
     window.addEventListener('resize', () => this._resize());
     this._raf = requestAnimationFrame((t) => this._loop(t));
   }
 
+  _initGL() {
+    const gl = this.gl;
+    this.lineProg = linkProgram(gl, LINE_VS, LINE_FS);
+    this.quadProg = linkProgram(gl, QUAD_VS, QUAD_FS);
+
+    this.lineLoc = {
+      aPos: gl.getAttribLocation(this.lineProg, 'aPos'),
+      aColor: gl.getAttribLocation(this.lineProg, 'aColor'),
+      aAlpha: gl.getAttribLocation(this.lineProg, 'aAlpha'),
+      uResolution: gl.getUniformLocation(this.lineProg, 'uResolution'),
+    };
+    this.quadLoc = {
+      aPos: gl.getAttribLocation(this.quadProg, 'aPos'),
+      uTex: gl.getUniformLocation(this.quadProg, 'uTex'),
+      uDecay: gl.getUniformLocation(this.quadProg, 'uDecay'),
+      uBg: gl.getUniformLocation(this.quadProg, 'uBg'),
+    };
+
+    this.quadBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+
+    this.lineBuf = gl.createBuffer();
+
+    // The trail feedback effect needs only ONE extra texture (not a full
+    // ping-pong pair of framebuffers): each frame renders straight to the
+    // visible canvas (fade pass + lines), then a single cheap
+    // gl.copyTexImage2D grabs that same visible framebuffer into this
+    // texture to serve as "previous frame" for the next fade pass. That
+    // replaces a whole extra textured full-screen draw+shader pass (a
+    // "blit to screen" step) with a raw pixel copy -- no shader
+    // invocation, the cheapest way the GPU can move a screen's worth of
+    // pixels.
+    this.prevTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, this.prevTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  }
+
   _resize() {
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    this.canvas.width = Math.floor(window.innerWidth * dpr);
-    this.canvas.height = Math.floor(window.innerHeight * dpr);
+    // Capped below the usual 2x/3x retina factor: fragment cost scales with
+    // the *square* of this (2x = 4x the pixels), and a background wireframe
+    // gains little visible sharpness past ~1.5x while paying a lot for it.
+    const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+    const w = Math.floor(window.innerWidth * dpr);
+    const h = Math.floor(window.innerHeight * dpr);
+    this.canvas.width = w;
+    this.canvas.height = h;
     this.dpr = dpr;
+    this.gl.viewport(0, 0, w, h);
+    // Re-seed the "previous frame" texture at the new size (blank -- one
+    // faded-from-black frame on resize is invisible in practice).
+    const gl = this.gl;
+    gl.bindTexture(gl.TEXTURE_2D, this.prevTex);
+    // RGB, not RGBA: the context below is created with alpha:false, so the
+    // default framebuffer has no alpha channel at all. copyTexImage2D
+    // (used every frame in _draw) requesting RGBA against an alpha-less
+    // framebuffer is a format mismatch that fails with GL_INVALID_OPERATION
+    // -- silently (WebGL errors don't throw), so the trail texture was
+    // never actually being updated. The fade shader only ever reads
+    // .rgb anyway, so RGB is also simply the correct format to ask for.
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, w, h, 0, gl.RGB, gl.UNSIGNED_BYTE, null);
   }
 
   // Bind the single persistent <audio> element once. createMediaElementSource
-  // can only be called once per element ever, so this must not be re-run
-  // when the track (src) changes -- only when the element itself changes.
+  // can only be called once per element ever, and doesn't itself need a user
+  // gesture (only audioCtx.resume() does), so this is safe to call as soon
+  // as the element exists.
   bindAudio(audioEl) {
     if (this.audioEl === audioEl) return;
     this.audioEl = audioEl;
@@ -118,7 +257,7 @@ class Landscape {
     const source = this.audioCtx.createMediaElementSource(audioEl);
     this.analyser = this.audioCtx.createAnalyser();
     this.analyser.fftSize = 256;
-    this.analyser.smoothingTimeConstant = 0.75;
+    this.analyser.smoothingTimeConstant = 0.6;
     source.connect(this.analyser);
     this.analyser.connect(this.audioCtx.destination);
     this.freqData = new Uint8Array(this.analyser.frequencyBinCount);
@@ -128,7 +267,6 @@ class Landscape {
     if (this.audioCtx && this.audioCtx.state === 'suspended') this.audioCtx.resume();
   }
 
-  // `track` carries {genre, sections:[{letter, seconds, intensity}, ...]}.
   setTrack(track) {
     this.track = track;
     this.sectionStarts = [];
@@ -141,6 +279,7 @@ class Landscape {
       t += s.seconds;
     });
     this.curSectionIdx = -1;
+    this.entities = [];
     this._maybeSwitchSection(0);
   }
 
@@ -165,9 +304,6 @@ class Landscape {
   }
 
   _currentBlendedTheme() {
-    // A plain object with the same shape as a THEMES entry, interpolated --
-    // used only as the starting point of the *next* crossfade so back-to-
-    // back section changes (a very short section) don't jump-cut.
     const a = this.themeFrom, b = this.themeTo, t = this.themeBlend;
     return {
       name: b.name, bg: rgbLerpArr(a.bg, b.bg, t), line: rgbLerpArr(a.line, b.line, t),
@@ -177,7 +313,7 @@ class Landscape {
     };
   }
 
-  _updateAudioFeatures() {
+  _updateAudioFeatures(dt) {
     if (!this.analyser) return;
     this.analyser.getByteFrequencyData(this.freqData);
     const n = this.freqData.length;
@@ -190,11 +326,36 @@ class Landscape {
     bass = bass / bassEnd / 255;
     mid = mid / (midEnd - bassEnd) / 255;
     treble = treble / (n - midEnd) / 255;
-    // Exponential smoothing so the terrain moves, not flickers.
+
     const k = 0.18;
     this.bass += (bass - this.bass) * k;
     this.mid += (mid - this.mid) * k;
     this.treble += (treble - this.treble) * k;
+
+    // Onset detector: a fast envelope tracks the instantaneous bass energy
+    // closely, a slow one only drifts toward it -- when the fast one pulls
+    // far enough ahead (a sudden hit), that's an "event".
+    this.bassFast += (bass - this.bassFast) * Math.min(1, dt * 14);
+    this.bassSlow += (bass - this.bassSlow) * Math.min(1, dt * 2.2);
+    const now = performance.now() / 1000;
+    if (this.bassFast > this.bassSlow * ONSET_RATIO + 0.03
+        && this.bassFast > 0.18
+        && now - this.lastSpawn > ONSET_REFRACTORY_S) {
+      this.lastSpawn = now;
+      this._spawnEntity();
+    }
+  }
+
+  _spawnEntity() {
+    if (this.entities.length > 10) this.entities.shift();
+    this.entities.push({
+      x: (Math.random() * 0.7 + 0.15), // fraction of canvas width
+      y: (Math.random() * 0.35 + 0.08), // fraction of canvas height (upper region)
+      rot0: Math.random() * Math.PI * 2,
+      spin: (Math.random() < 0.5 ? -1 : 1) * (0.6 + Math.random() * 1.2),
+      born: performance.now() / 1000,
+      hue: Math.random(),
+    });
   }
 
   _loop(now) {
@@ -205,35 +366,23 @@ class Landscape {
     if (this.audioEl && this.track && !this.audioEl.paused) {
       this._maybeSwitchSection(this.audioEl.currentTime || 0);
     }
-    this._updateAudioFeatures();
+    this._updateAudioFeatures(dt);
 
     if (this.themeBlend < 1) {
       this.themeBlend = Math.min(1, (now - this.themeBlendStart) / 1200);
     }
     const theme = this._currentBlendedTheme();
-
     const energy = this.bass * 0.6 + this.mid * 0.3 + this.treble * 0.1;
     const speed = 1.4 + energy * 3.2 + this.designedIntensity * 1.4;
     this.scrollZ += speed * dt;
 
-    this._draw(theme, energy);
+    this._draw(theme, energy, now / 1000);
   }
 
-  _draw(theme, energy) {
-    const { ctx, canvas } = this;
-    const w = canvas.width, h = canvas.height;
-
-    ctx.fillStyle = rgbArrToStr(theme.bg);
-    ctx.fillRect(0, 0, w, h);
-
-    const cols = 46, rows = 24;
+  _buildVertices(theme, energy, nowS) {
+    const w = this.canvas.width, h = this.canvas.height;
+    const cols = 38, rows = 18;
     const dx = 0.85;
-    // zNear must stay well clear of the grid's own half-width (cols*dx/2):
-    // a real bug this had was zNear=1 with a ~40-unit-wide grid, meaning
-    // the near plane subtended a vastly wider angle than any sane field of
-    // view -- almost every near-row point projected thousands of pixels
-    // off-screen, so nothing but a couple of near-dead-centre pixels
-    // (invisible against the background) ever landed in frame.
     const zNear = 5.0, zFar = 34.0;
     const camY = 0.25 + this.designedIntensity * 0.35;
     const focal = 1.3;
@@ -246,8 +395,7 @@ class Landscape {
       for (const [freq, amp, speedMul] of theme.octaves) {
         v += Math.sin(x * freq + z * freq * 0.6 + this.scrollZ * speedMul) * amp;
       }
-      v = shapeHeight(theme.shape, v);
-      return v * ampBase * ampAudio;
+      return shapeHeight(theme.shape, v) * ampBase * ampAudio;
     };
 
     const pts = [];
@@ -255,71 +403,118 @@ class Landscape {
       const z = zNear + (r / (rows - 1)) * (zFar - zNear);
       const worldZSample = z + this.scrollZ;
       const row = [];
+      const scale = (focal * Math.min(w, h)) / z;
+      const fade = Math.max(0.06, 1 - r / rows);
       for (let c = 0; c < cols; c++) {
         const x = (c - (cols - 1) / 2) * dx;
-        const hgt = heightAt(x, worldZSample);
-        const relY = hgt - camY;
-        const scale = (focal * Math.min(w, h)) / z;
-        const sx = centerX + x * scale;
-        const sy = centerY + relY * scale;
-        row.push([sx, sy, z]);
+        const relY = heightAt(x, worldZSample) - camY;
+        row.push([centerX + x * scale, centerY + relY * scale, fade]);
       }
       pts.push(row);
     }
 
-    // Performance note: an earlier version used ctx.shadowBlur (native
-    // canvas shadows are a full per-pixel blur, one of the single most
-    // expensive canvas-2D operations) *and* stroked every column segment
-    // individually to get a per-vertex depth fade -- ~1000+ stroke() calls
-    // a frame, each paying the shadow-blur cost. Measured: ~12fps on a
-    // retina display. Fixed two ways: (1) depth-fade is bucketed into a
-    // handful of BANDS, each drawn as one multi-subpath stroke() call
-    // instead of one call per row/segment; (2) the glow is now a cheap
-    // second wide/dim stroke pass instead of native shadowBlur.
-    const BANDS = 6;
-    const bandOf = (r) => Math.min(BANDS - 1, Math.floor((r / rows) * BANDS));
-    const bandAlpha = (b) => 0.15 + (1 - b / (BANDS - 1)) * 0.75;
-
-    const strokeLayer = (lineWidth, alphaMul) => {
-      ctx.lineWidth = lineWidth;
-      // Rows: one path per band, each row in that band as its own subpath.
-      for (let b = 0; b < BANDS; b++) {
-        ctx.globalAlpha = bandAlpha(b) * alphaMul;
-        ctx.beginPath();
-        for (let r = 0; r < rows; r++) {
-          if (bandOf(r) !== b) continue;
-          for (let c = 0; c < cols; c++) {
-            const [sx, sy] = pts[r][c];
-            if (c === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
-          }
-        }
-        ctx.stroke();
-      }
-      // Columns: one path per band, each column's run of rows within that
-      // band as its own subpath (rows in a band are contiguous, so this is
-      // a single connected polyline per column per band).
-      for (let b = 0; b < BANDS; b++) {
-        ctx.globalAlpha = bandAlpha(b) * alphaMul;
-        ctx.beginPath();
-        for (let c = 0; c < cols; c++) {
-          let started = false;
-          for (let r = 0; r < rows; r++) {
-            if (bandOf(r) !== b) { started = false; continue; }
-            const [sx, sy] = pts[r][c];
-            if (!started) { ctx.moveTo(sx, sy); started = true; } else { ctx.lineTo(sx, sy); }
-          }
-        }
-        ctx.stroke();
-      }
+    const [lr, lg, lb] = theme.line;
+    const cr = lr / 255, cg = lg / 255, cb = lb / 255;
+    const verts = [];
+    const pushSeg = (x0, y0, a0, x1, y1, a1, r, g, b) => {
+      verts.push(x0, y0, r, g, b, a0, x1, y1, r, g, b, a1);
     };
 
-    ctx.strokeStyle = rgbArrToStr(theme.line);
-    // Cheap glow substitute: a wider, dimmer pass underneath the crisp
-    // line, brightened a little with the audio's energy -- no shadowBlur.
-    strokeLayer((3.2 + energy * 2.5) * this.dpr, 0.22 + energy * 0.18);
-    strokeLayer(Math.max(1, 1.1 * this.dpr), 0.9);
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols - 1; c++) {
+        const [x0, y0, a0] = pts[r][c], [x1, y1, a1] = pts[r][c + 1];
+        pushSeg(x0, y0, a0 * 0.9, x1, y1, a1 * 0.9, cr, cg, cb);
+      }
+    }
+    for (let c = 0; c < cols; c++) {
+      for (let r = 0; r < rows - 1; r++) {
+        const [x0, y0, a0] = pts[r][c], [x1, y1, a1] = pts[r + 1][c];
+        pushSeg(x0, y0, a0 * 0.9, x1, y1, a1 * 0.9, cr, cg, cb);
+      }
+    }
 
-    ctx.globalAlpha = 1;
+    // Event entities: expanding, rotating, fading wireframe rings -- each
+    // audio "event" (see _updateAudioFeatures's onset detector) punches one
+    // of these out. Brightened relative to the terrain so they pop.
+    const [gr, gg, gb] = theme.glow;
+    const er = Math.min(1, cr * 1.3 + 0.15), eg = Math.min(1, cg * 1.3 + 0.15), eb = Math.min(1, cb * 1.3 + 0.15);
+    this.entities = this.entities.filter((e) => nowS - e.born < ENTITY_LIFETIME_S);
+    for (const e of this.entities) {
+      const age = (nowS - e.born) / ENTITY_LIFETIME_S; // 0..1
+      const alpha = (1 - age) * 0.85;
+      const scale = (0.03 + age * 0.22) * Math.min(w, h);
+      const rot = e.rot0 + e.spin * (nowS - e.born);
+      const cx = e.x * w, cy = e.y * h;
+      const cosr = Math.cos(rot), sinr = Math.sin(rot);
+      for (let i = 0; i < RING_SEGMENTS; i++) {
+        const [ux0, uy0] = RING_PTS[i];
+        const [ux1, uy1] = RING_PTS[(i + 1) % RING_SEGMENTS];
+        const x0 = cx + (ux0 * cosr - uy0 * sinr) * scale;
+        const y0 = cy + (ux0 * sinr + uy0 * cosr) * scale;
+        const x1 = cx + (ux1 * cosr - uy1 * sinr) * scale;
+        const y1 = cy + (ux1 * sinr + uy1 * cosr) * scale;
+        pushSeg(x0, y0, alpha, x1, y1, alpha, er, eg, eb);
+      }
+      // A couple of cheap radial spokes so it reads as a "burst", not just a ring.
+      for (let i = 0; i < 4; i++) {
+        const a = rot + (i / 4) * Math.PI * 2;
+        const x1 = cx + Math.cos(a) * scale * 1.4;
+        const y1 = cy + Math.sin(a) * scale * 1.4;
+        pushSeg(cx, cy, 0, x1, y1, alpha * 0.6, gr / 255, gg / 255, gb / 255);
+      }
+    }
+
+    return new Float32Array(verts);
+  }
+
+  _draw(theme, energy, nowS) {
+    const gl = this.gl;
+    const w = this.canvas.width, h = this.canvas.height;
+    const verts = this._buildVertices(theme, energy, nowS);
+    const vertCount = verts.length / 6;
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, w, h);
+    gl.disable(gl.BLEND);
+
+    // Pass 1: fade the previous frame (captured below) toward the theme
+    // background -- the trail, a full-screen GLSL blend rather than
+    // per-object fade bookkeeping. Drawn straight to the visible canvas.
+    gl.useProgram(this.quadProg);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuf);
+    gl.enableVertexAttribArray(this.quadLoc.aPos);
+    gl.vertexAttribPointer(this.quadLoc.aPos, 2, gl.FLOAT, false, 0, 0);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.prevTex);
+    gl.uniform1i(this.quadLoc.uTex, 0);
+    gl.uniform1f(this.quadLoc.uDecay, 0.90);
+    gl.uniform3f(this.quadLoc.uBg, theme.bg[0] / 255, theme.bg[1] / 255, theme.bg[2] / 255);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+    // Pass 2: draw this frame's lines additively on top (sharp, glows where
+    // segments overlap -- no native shadow/blur needed).
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+    gl.useProgram(this.lineProg);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.lineBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, verts, gl.DYNAMIC_DRAW);
+    const stride = 6 * 4;
+    gl.enableVertexAttribArray(this.lineLoc.aPos);
+    gl.vertexAttribPointer(this.lineLoc.aPos, 2, gl.FLOAT, false, stride, 0);
+    gl.enableVertexAttribArray(this.lineLoc.aColor);
+    gl.vertexAttribPointer(this.lineLoc.aColor, 3, gl.FLOAT, false, stride, 8);
+    gl.enableVertexAttribArray(this.lineLoc.aAlpha);
+    gl.vertexAttribPointer(this.lineLoc.aAlpha, 1, gl.FLOAT, false, stride, 20);
+    gl.uniform2f(this.lineLoc.uResolution, w, h);
+    gl.lineWidth(1);
+    gl.drawArrays(gl.LINES, 0, vertCount);
+
+    // Pass 3: grab the frame we just rendered as "previous" for next
+    // frame's fade -- a raw pixel copy off the default framebuffer, no
+    // shader/draw call at all (cheaper than the textured blit this
+    // replaced).
+    gl.bindTexture(gl.TEXTURE_2D, this.prevTex);
+    gl.copyTexImage2D(gl.TEXTURE_2D, 0, gl.RGB, 0, 0, w, h, 0);
   }
 }
 
