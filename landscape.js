@@ -231,6 +231,8 @@ class Landscape {
     this.focusObj = null;
     this.focusRetargetAt = 0;
     this.lastFocusBeat = -FOCUS_BEATS;
+    this.orbitAngle = 0;
+    this.orbitDir = 1;
 
     // Beat clock, derived from the track's own BPM + real playback time
     // (not the motion clock) -- see header comment.
@@ -506,18 +508,17 @@ class Landscape {
       this._spawnEvent();
       if (strength > 0.55) this._spawnEvent();
       if (strength > 0.85) this._spawnEvent();
-      // Flip rotation direction (sign, not magnitude -- a plain reroll can
-      // coincidentally still look like "more of the same") on a random
-      // subset of the pool on every hit -- distinct from the beat-
-      // quantized reshape below, this is what keeps rotation itself from
-      // ever settling into one fixed, "just spinning one way" for the
-      // whole track.
+      // Flip rotation direction -- all three axes together, not each
+      // independently -- on a random subset of the pool on every hit.
+      // Flipping axes independently could still leave the strongest axis
+      // (the one that actually dominates how the tumble reads) pointing
+      // the same way as before, which is exactly why this kept looking
+      // like "still just spinning one way": a partial flip is invisible.
+      // A whole-object flip is what actually reverses the visible tumble.
       for (const o of this.objects) {
         if (Math.random() < 0.4) {
           const u = o.userData;
-          if (Math.random() < 0.6) u.spinSign.x *= -1;
-          if (Math.random() < 0.6) u.spinSign.y *= -1;
-          if (Math.random() < 0.6) u.spinSign.z *= -1;
+          u.spinSign.x *= -1; u.spinSign.y *= -1; u.spinSign.z *= -1;
         }
       }
     }
@@ -636,7 +637,12 @@ class Landscape {
     // not playing, so motionT/flightDist simply hold their value.
     const energy = playing ? (this.bass * 0.6 + this.mid * 0.3 + this.treble * 0.1) : 0;
     const bpmRatio = bpm / REF_BPM;
-    const motionRate = playing ? (0.35 + energy * 1.7 + this.designedIntensity * 0.25) * bpmRatio : 0;
+    // Measured across real playback, energy typically runs ~0.17 (quiet)
+    // to ~0.61 (loud). A 0.35 baseline swamped that range (quiet-vs-loud
+    // was under 2x); a lower baseline with a bigger energy weight gives a
+    // clearly perceptible ~3x swing so the whole scene's pace visibly
+    // tracks the music instead of just gently drifting with it.
+    const motionRate = playing ? (0.12 + energy * 2.8 + this.designedIntensity * 0.2) * bpmRatio : 0;
     const dMotion = dt * motionRate;
     this.motionT += dMotion;
     this.flightDist += dMotion * 46;
@@ -669,10 +675,23 @@ class Landscape {
       u.baseX = u.centerX;
       u.orbitCamR = 22 + Math.random() * 16;
       this.lastFocusBeat = beatCount;
+      // The orbit direction itself never used to change -- orbitAngle was
+      // derived straight from motionT*ORBIT_RATE, a value that only ever
+      // grows, so the camera circled the same rotational way forever; a
+      // focus change only ever looked like a teleport to a new position
+      // that then kept circling exactly as before. Flipping the direction
+      // here, on the same "reset" moment the subject changes, is what
+      // actually varies it.
+      this.orbitDir *= -1;
     }
     const focus = this.focusObj;
     const R = focus.userData.orbitCamR;
-    const orbitAngle = motionT * ORBIT_RATE;
+    // Accumulated from dMotion*direction each frame (not derived from
+    // motionT directly), so a direction flip changes which way the angle
+    // moves from here on rather than snapping the whole angle to a
+    // mirrored value.
+    this.orbitAngle += dMotion * ORBIT_RATE * this.orbitDir;
+    const orbitAngle = this.orbitAngle;
     const fx = focus.position.x, fy = focus.position.y + 2, fz = pivotZ;
     cam.position.set(fx + Math.cos(orbitAngle) * R, fy + 6 + Math.sin(motionT * 0.12) * 2, fz + Math.sin(orbitAngle) * R);
     cam.up.set(0, 1, 0);
@@ -691,14 +710,23 @@ class Landscape {
     this.objectMat.uniforms.uColor.value.setHex(theme.line);
     this.objectMat.uniforms.uFog.value.setHex(theme.bg);
 
+    // Rotation's own speed kicker: dMotion already carries the slow
+    // ambient energy contour (see header), but that's smoothed enough
+    // that a viewer can't feel it tracking the actual music. Layering the
+    // FAST bass envelope in as a direct multiplier makes every hit
+    // visibly surge the tumble and let it settle back between hits --
+    // the part that actually reads as "responding to the music".
+    const rotKick = 1 + this.bassFast * 4.5;
+
     for (const o of this.objects) {
       const u = o.userData;
 
       // Continuous rotation -- the "dance" never stops, it just plays
-      // faster or slower with dMotion (which is itself energy-scaled).
-      o.rotation.x += u.spinBase.x * u.spinSign.x * dMotion;
-      o.rotation.y += u.spinBase.y * u.spinSign.y * dMotion;
-      o.rotation.z += u.spinBase.z * u.spinSign.z * dMotion;
+      // faster or slower with dMotion (which is itself energy-scaled) and
+      // surges further with rotKick on top.
+      o.rotation.x += u.spinBase.x * u.spinSign.x * dMotion * rotKick;
+      o.rotation.y += u.spinBase.y * u.spinSign.y * dMotion * rotKick;
+      o.rotation.z += u.spinBase.z * u.spinSign.z * dMotion * rotKick;
 
       if (u.behavior === 'orbit') {
         o.position.x = u.centerX + Math.cos(motionT * u.orbitRate + u.bobPhase) * u.orbitRadius;
@@ -733,10 +761,19 @@ class Landscape {
         // make the direction change definite rather than a coin flip.
         u.spinBase.set(0.6 + Math.random() * 2.4, 0.6 + Math.random() * 2.4, 0.6 + Math.random() * 2.4);
         u.spinSign.x *= -1; u.spinSign.y *= -1; u.spinSign.z *= -1;
+        // The burst alone wasn't always noticeable -- punctuate the
+        // reshape with a couple of extra one-shot shapes appearing right
+        // at the object, so the moment reads as a small event, not just a
+        // silhouette quietly changing.
+        this._spawnEvent(theme);
+        if (Math.random() < 0.5) this._spawnEvent(theme);
       }
+      // Scale-burst envelope, 2.5x bigger peak and a longer window than
+      // the original pass -- that one was too subtle to register as an
+      // "explosion" against the object's base size.
       const beatsSinceReshape = (beatCount - u.lastReshapeBeat) + beatPhase;
-      const burstWindow = 0.35;
-      o.scale.setScalar(beatsSinceReshape < burstWindow ? 1 + Math.sin(Math.min(1, beatsSinceReshape / burstWindow) * Math.PI) * 0.8 : 1);
+      const burstWindow = 0.55;
+      o.scale.setScalar(beatsSinceReshape < burstWindow ? 1 + Math.sin(Math.min(1, beatsSinceReshape / burstWindow) * Math.PI) * 2.0 : 1);
 
       if (o === focus) {
         // Pinned to the advancing orbit pivot instead of the ordinary
