@@ -16,15 +16,25 @@
 // letter and cross-fades in over ~1.2s whenever the section changes, so a
 // repeated letter always gets the same world.
 
+// Index into SHAPE_KINDS: 0 ico, 1 dodeca, 2 octa, 3 tetra, 4 torus,
+// 5 torusKnot, 6 box, 7 cone. Each theme leans on a handful of these
+// (picked most of the time, not exclusively -- see pickShapeKind) so a
+// "world" reads as a coherent family of forms while still surprising you.
 const THEMES = [
-  { name: 'Dunes', bg: 0x0a0a0d, line: 0x9099c9, glow: 0x4a5080, shape: 0 },
-  { name: 'Crystal Peaks', bg: 0x070a0d, line: 0xbfe3e0, glow: 0x3f7f78, shape: 1 },
-  { name: 'Deep Canyon', bg: 0x0a0810, line: 0xa37fc9, glow: 0x4a3560, shape: 2 },
-  { name: 'Frozen Ridge', bg: 0x080a0c, line: 0x9fc4d6, glow: 0x3a5566, shape: 0 },
-  { name: 'Dusk Fields', bg: 0x0a0810, line: 0xb98aa0, glow: 0x5c3648, shape: 1 },
-  { name: 'Still Water', bg: 0x06090a, line: 0x7fa89e, glow: 0x294844, shape: 2 },
+  { name: 'Dunes', bg: 0x0a0a0d, line: 0x9099c9, glow: 0x4a5080, shapes: [0, 7, 3] },
+  { name: 'Crystal Peaks', bg: 0x070a0d, line: 0xbfe3e0, glow: 0x3f7f78, shapes: [0, 2, 5] },
+  { name: 'Deep Canyon', bg: 0x0a0810, line: 0xa37fc9, glow: 0x4a3560, shapes: [1, 6, 3] },
+  { name: 'Frozen Ridge', bg: 0x080a0c, line: 0x9fc4d6, glow: 0x3a5566, shapes: [2, 3, 4] },
+  { name: 'Dusk Fields', bg: 0x0a0810, line: 0xb98aa0, glow: 0x5c3648, shapes: [4, 7, 1] },
+  { name: 'Still Water', bg: 0x06090a, line: 0x7fa89e, glow: 0x294844, shapes: [5, 4, 0] },
 ];
-const SHAPE_KINDS = ['ico', 'dodeca', 'octa'];
+const SHAPE_KINDS = ['ico', 'dodeca', 'octa', 'tetra', 'torus', 'torusKnot', 'box', 'cone'];
+function pickShapeKind(theme) {
+  if (theme && theme.shapes && theme.shapes.length && Math.random() < 0.7) {
+    return theme.shapes[(Math.random() * theme.shapes.length) | 0];
+  }
+  return (Math.random() * SHAPE_KINDS.length) | 0;
+}
 
 function lerp(a, b, t) { return a + (b - a) * t; }
 function hexToRgb(hex) { return [(hex >> 16) & 255, (hex >> 8) & 255, hex & 255]; }
@@ -111,9 +121,17 @@ const QUAD_FS = `
 `;
 
 function makeShapeGeometry(kind, radius) {
-  const src = kind === 0 ? new THREE.IcosahedronGeometry(radius, 0)
-    : kind === 1 ? new THREE.DodecahedronGeometry(radius, 0)
-    : new THREE.OctahedronGeometry(radius, 0);
+  let src;
+  switch (kind) {
+    case 0: src = new THREE.IcosahedronGeometry(radius, 0); break;
+    case 1: src = new THREE.DodecahedronGeometry(radius, 0); break;
+    case 2: src = new THREE.OctahedronGeometry(radius, 0); break;
+    case 3: src = new THREE.TetrahedronGeometry(radius, 0); break;
+    case 4: src = new THREE.TorusGeometry(radius * 0.8, radius * 0.28, 6, 14); break;
+    case 5: src = new THREE.TorusKnotGeometry(radius * 0.55, radius * 0.16, 48, 6, 2, 3); break;
+    case 6: src = new THREE.BoxGeometry(radius * 1.3, radius * 1.3, radius * 1.3); break;
+    default: src = new THREE.ConeGeometry(radius * 0.85, radius * 1.8, 6); break;
+  }
   return new THREE.EdgesGeometry(src);
 }
 
@@ -130,6 +148,20 @@ class Landscape {
     this.spawned = [];
     this.lastFrameTime = performance.now();
     this.flightDist = 0;
+
+    // Continuous 3D wander: a slowly-evolving phase (its rate itself
+    // speeds up with energy) drives layered sines on x/y so the flight
+    // path actually curves and drifts in every direction, not just side
+    // to side. Kicks are a damped-spring impulse (position + roll + FOV)
+    // fired on every bass onset, on top of the wander -- the "push" a beat
+    // gives the camera, decaying back out over a few hundred ms.
+    this.pathPhase = 0;
+    this.camKick = new THREE.Vector3(0, 0, 0);
+    this.camKickVel = new THREE.Vector3(0, 0, 0);
+    this.rollKick = 0;
+    this.rollKickVel = 0;
+    this.fovBase = 62;
+    this.fovKick = 0;
 
     this.track = null;
     this.sectionStarts = [];
@@ -171,7 +203,8 @@ class Landscape {
     });
 
     this.objects = [];
-    for (let i = 0; i < OBJECT_COUNT; i++) this.objects.push(this._makeObject(true));
+    const startTheme = this._blendedThemeSnapshot();
+    for (let i = 0; i < OBJECT_COUNT; i++) this.objects.push(this._makeObject(true, startTheme));
 
     this.spawnGroup = new THREE.Group();
     this.scene.add(this.spawnGroup);
@@ -210,23 +243,56 @@ class Landscape {
     return geo;
   }
 
-  _makeObject(randomizeZ) {
-    const kind = (Math.random() * 3) | 0;
+  // Each object gets one of four independent motion "behaviors" so the
+  // field doesn't read as one repeated bob animation copy-pasted sixteen
+  // times: plain bob, a slow horizontal orbit around its own anchor, a
+  // wide lateral sway, or a bass-driven scale pulse (on top of a bob).
+  _makeObject(randomizeZ, theme) {
+    const kind = pickShapeKind(theme);
     const radius = 4 + Math.random() * 9;
     const mesh = new THREE.LineSegments(makeShapeGeometry(kind, radius), this.objectMat);
     mesh.frustumCulled = false;
+    const baseX = (Math.random() - 0.5) * 140;
+    const behaviors = ['bob', 'orbit', 'sway', 'pulse'];
     mesh.userData = {
       kind,
+      baseX, centerX: baseX,
       baseY: 6 + Math.random() * 22,
       bobAmp: 1.5 + Math.random() * 3,
       bobRate: 0.3 + Math.random() * 0.5,
       bobPhase: Math.random() * Math.PI * 2,
-      spin: new THREE.Vector3((Math.random() - 0.5) * 0.25, (Math.random() - 0.5) * 0.25, (Math.random() - 0.5) * 0.25),
+      behavior: behaviors[(Math.random() * behaviors.length) | 0],
+      orbitRadius: 8 + Math.random() * 20,
+      orbitRate: 0.15 + Math.random() * 0.35,
+      swayAmp: 8 + Math.random() * 16,
+      swayRate: 0.08 + Math.random() * 0.22,
+      spin: new THREE.Vector3((Math.random() - 0.5) * 0.3, (Math.random() - 0.5) * 0.3, (Math.random() - 0.5) * 0.3),
     };
-    mesh.position.set((Math.random() - 0.5) * 140, mesh.userData.baseY,
+    mesh.position.set(baseX, mesh.userData.baseY,
       -(randomizeZ ? Math.random() * OBJECT_SPAN : 0));
     this.scene.add(mesh);
     return mesh;
+  }
+
+  _reshapeObject(o, theme) {
+    const u = o.userData;
+    o.geometry.dispose();
+    u.kind = pickShapeKind(theme);
+    const radius = 4 + Math.random() * 9;
+    o.geometry = makeShapeGeometry(u.kind, radius);
+  }
+
+  // Recycling alone (an object drifting past the camera and being pushed
+  // back out ahead) would take up to OBJECT_SPAN/speed seconds -- tens of
+  // seconds -- to visit every object, far too slow for a section change
+  // to actually look different. Reshape most of the pool immediately and
+  // punctuate the cut with a small spawn burst.
+  _retheme(theme) {
+    for (const o of this.objects) {
+      if (Math.random() < 0.8) this._reshapeObject(o, theme);
+    }
+    const bursts = 2 + Math.floor(Math.random() * 2);
+    for (let i = 0; i < bursts; i++) this._spawnEvent(theme);
   }
 
   _resize() {
@@ -297,6 +363,7 @@ class Landscape {
       this.designedIntensity = (section && typeof section.intensity === 'number') ? section.intensity : 0.4;
       const el = document.getElementById('npLandscape');
       if (el) el.textContent = theme.name;
+      this._retheme(theme);
     }
   }
 
@@ -304,7 +371,7 @@ class Landscape {
     const a = this.themeFrom, b = this.themeTo, t = this.themeBlend;
     return {
       name: b.name, bg: rgbLerpHex(a.bg, b.bg, t), line: rgbLerpHex(a.line, b.line, t),
-      glow: rgbLerpHex(a.glow, b.glow, t), shape: t > 0.5 ? b.shape : a.shape,
+      glow: rgbLerpHex(a.glow, b.glow, t), shapes: t > 0.5 ? b.shapes : a.shapes,
     };
   }
 
@@ -331,15 +398,26 @@ class Landscape {
         && now - this.lastSpawn > ONSET_REFRACTORY_S) {
       this.lastSpawn = now;
       this._spawnEvent();
+      // The actual "push": every onset shoves the camera with a damped-
+      // spring impulse (position + roll + a punch-in on FOV) that the
+      // continuous wander below rides on top of and springs back out of
+      // over a few hundred ms -- this is what makes a hit visibly move
+      // the whole world, not just add another spinning shape.
+      const strength = Math.min(1, (this.bassFast - this.bassSlow) * 2.2);
+      this.camKickVel.x += (Math.random() - 0.5) * 14 * strength;
+      this.camKickVel.y += (Math.random() - 0.5) * 7 * strength;
+      this.camKickVel.z += -(3 + Math.random() * 5) * strength;
+      this.rollKickVel += (Math.random() - 0.5) * 2.2 * strength;
+      this.fovKick += (5 + Math.random() * 5) * strength;
     }
   }
 
   // Each audio "event" punches out a wireframe polyhedron near the flight
   // path: it grows in, then dissolves (opacity fade) and is disposed.
-  _spawnEvent() {
-    if (this.spawned.length > 8) this._disposeSpawn(this.spawned.shift());
-    const theme = this._blendedThemeSnapshot();
-    const kind = (Math.random() * 3) | 0;
+  _spawnEvent(themeOverride) {
+    if (this.spawned.length > 10) this._disposeSpawn(this.spawned.shift());
+    const theme = themeOverride || this._blendedThemeSnapshot();
+    const kind = pickShapeKind(theme);
     const radius = 2 + Math.random() * 2.5;
     const mat = new THREE.ShaderMaterial({
       uniforms: { uColor: { value: new THREE.Color(theme.glow) }, uFog: { value: new THREE.Color(theme.bg) },
@@ -354,7 +432,10 @@ class Landscape {
     mesh.scale.setScalar(0.05);
     this.spawnGroup.add(mesh);
     this.spawned.push({ mesh, mat, born: performance.now() / 1000,
-      spin: new THREE.Vector3((Math.random() - 0.5) * 1.2, (Math.random() - 0.5) * 1.2, (Math.random() - 0.5) * 1.2) });
+      // Drift sideways as it grows, so a burst doesn't read as several
+      // copies of the same shape pinned to one spot.
+      drift: (Math.random() - 0.5) * 10,
+      spin: new THREE.Vector3((Math.random() - 0.5) * 1.6, (Math.random() - 0.5) * 1.6, (Math.random() - 0.5) * 1.6) });
   }
 
   _disposeSpawn(s) {
@@ -385,21 +466,60 @@ class Landscape {
 
   _updateWorld(dt, nowS, theme, energy, speed) {
     const cam = this.camera;
-    // Continuous forward flight, with a gentle autonomous drift for an
-    // organic "fly around" feel rather than a dead-straight line.
-    cam.position.z = -this.flightDist;
-    cam.position.x = Math.sin(nowS * 0.09) * 14 + Math.sin(nowS * 0.021) * 26;
+
+    // Damped-spring relaxation of the onset kicks: pulled back toward
+    // zero by a spring, slowed by damping, so each hit reads as a snap
+    // followed by a settle rather than an instant teleport-and-cut.
+    const springK = 46, damping = 7.5;
+    this.camKickVel.x += (-springK * this.camKick.x - damping * this.camKickVel.x) * dt;
+    this.camKickVel.y += (-springK * this.camKick.y - damping * this.camKickVel.y) * dt;
+    this.camKickVel.z += (-springK * this.camKick.z - damping * this.camKickVel.z) * dt;
+    this.camKick.addScaledVector(this.camKickVel, dt);
+    this.rollKickVel += (-springK * this.rollKick - damping * this.rollKickVel) * dt;
+    this.rollKick += this.rollKickVel * dt;
+    this.fovKick += (0 - this.fovKick) * Math.min(1, dt * 6);
+    // A dense run of onsets (drum'n'bass, say) can stack impulses faster
+    // than the spring settles them -- clamp so that reads as "energetic"
+    // rather than the horizon actually flipping or the lens fisheye-ing.
+    this.camKick.x = Math.max(-40, Math.min(40, this.camKick.x));
+    this.camKick.y = Math.max(-25, Math.min(25, this.camKick.y));
+    this.camKick.z = Math.max(-25, Math.min(25, this.camKick.z));
+    this.rollKick = Math.max(-0.9, Math.min(0.9, this.rollKick));
+    this.fovKick = Math.max(0, Math.min(25, this.fovKick));
+
+    // The continuous wander: a phase that itself speeds up with energy
+    // (louder sections turn the path faster, not just further), driving
+    // several layered sines per axis so the camera travels a real curved
+    // path through x/y/z instead of a straight line with a side-to-side
+    // wobble. ampScale breathes the whole path wider on louder material.
+    this.pathPhase += dt * (0.15 + energy * 0.6);
+    const ph = this.pathPhase;
+    const ampScale = 0.55 + energy * 1.3 + this.designedIntensity * 0.3;
+    const wanderX = (Math.sin(ph * 0.9) * 13 + Math.sin(ph * 0.23 + 1.4) * 27) * ampScale;
+    const wanderY = (Math.sin(ph * 0.6 + 2.1) * 3.2 + Math.cos(ph * 0.17) * 2.4) * ampScale;
+
+    cam.position.z = -this.flightDist + this.camKick.z;
+    cam.position.x = wanderX + this.camKick.x;
     // Kept low and close to the floor ("eye just above the surface") --
-    // at the earlier height (~8-12 units) with a shallow downward tilt,
-    // the floor sat almost entirely below the visible frustum and never
+    // at an earlier height (~8-12 units) with a shallow downward tilt, the
+    // floor sat almost entirely below the visible frustum and never
     // actually showed as a grid. Low eye height + a real downward tilt is
     // what makes a wide, receding wireframe floor with objects clearly
     // floating *above* it, rather than eye-level clutter.
-    cam.position.y = 3.2 + Math.sin(nowS * 0.05) * 0.6 + this.designedIntensity * 0.8;
-    const lookX = cam.position.x + Math.sin(nowS * 0.09 + 0.3) * 10;
+    cam.position.y = 3.2 + wanderY * 0.6 + this.designedIntensity * 0.8 + this.camKick.y;
+
+    const lookX = cam.position.x + Math.sin(ph * 0.9 + 0.3) * 10 * ampScale;
     const lookZ = cam.position.z - 60;
-    cam.up.set(0, 1, 0);
+    // Bank into the turns (proportional to how hard the path is curving)
+    // plus the onset roll-kick, faked by tilting the up vector rather than
+    // fighting lookAt's own orientation each frame -- "spin it" without
+    // ever losing the horizon entirely.
+    const bank = Math.cos(ph * 0.9) * 0.11 * ampScale + this.rollKick;
+    cam.up.set(Math.sin(bank), Math.cos(bank), 0);
     cam.lookAt(lookX, cam.position.y - 9, lookZ);
+
+    cam.fov = this.fovBase + this.fovKick;
+    cam.updateProjectionMatrix();
 
     this.floorMesh.position.z = cam.position.z;
     this.floorMesh.position.x = cam.position.x;
@@ -412,15 +532,39 @@ class Landscape {
     this.objectMat.uniforms.uFog.value.setHex(theme.bg);
 
     const bounce = 0.5 + this.bass * 2.2;
+    const spinRate = 1 + energy * 2.2;
     for (const o of this.objects) {
       const u = o.userData;
-      o.rotation.x += u.spin.x * dt; o.rotation.y += u.spin.y * dt; o.rotation.z += u.spin.z * dt;
-      o.position.y = u.baseY + Math.sin(nowS * u.bobRate + u.bobPhase) * u.bobAmp * bounce;
-      // Recycle objects that have drifted behind the camera back out ahead,
-      // so a fixed small pool reads as an endless field of forms.
+      o.rotation.x += u.spin.x * dt * spinRate;
+      o.rotation.y += u.spin.y * dt * spinRate;
+      o.rotation.z += u.spin.z * dt * spinRate;
+
+      if (u.behavior === 'orbit') {
+        const r = u.orbitRadius * (0.7 + energy * 0.7);
+        o.position.x = u.centerX + Math.cos(nowS * u.orbitRate + u.bobPhase) * r;
+        o.position.y = u.baseY + Math.sin(nowS * u.orbitRate + u.bobPhase) * r * 0.4;
+      } else if (u.behavior === 'sway') {
+        o.position.x = u.baseX + Math.sin(nowS * u.swayRate + u.bobPhase) * u.swayAmp * (0.6 + energy);
+        o.position.y = u.baseY + Math.sin(nowS * u.bobRate + u.bobPhase) * u.bobAmp * bounce * 0.6;
+      } else {
+        o.position.x = u.baseX;
+        o.position.y = u.baseY + Math.sin(nowS * u.bobRate + u.bobPhase) * u.bobAmp * bounce;
+      }
+      if (u.behavior === 'pulse') {
+        o.scale.setScalar(1 + this.bass * 0.6);
+      } else if (o.scale.x !== 1) {
+        o.scale.setScalar(1);
+      }
+
+      // Recycle objects that have drifted behind the camera back out
+      // ahead, so a fixed small pool reads as an endless field of forms.
+      // Occasionally reshape on recycle too, so the field keeps turning
+      // over its own variety even mid-section, not just at a theme cut.
       if (o.position.z > cam.position.z + 30) {
         o.position.z -= OBJECT_SPAN;
-        o.position.x = cam.position.x + (Math.random() - 0.5) * 140;
+        u.baseX = cam.position.x + (Math.random() - 0.5) * 150;
+        u.centerX = u.baseX;
+        if (Math.random() < 0.3) this._reshapeObject(o, theme);
       }
     }
 
@@ -431,6 +575,7 @@ class Landscape {
       const growT = Math.min(1, age / 0.3);
       const grow = growT * growT * (3 - 2 * growT);
       s.mesh.scale.setScalar(0.05 + grow * 1.3);
+      s.mesh.position.x += s.drift * dt;
       s.mesh.rotation.x += s.spin.x * dt; s.mesh.rotation.y += s.spin.y * dt; s.mesh.rotation.z += s.spin.z * dt;
       s.mat.opacity = age < 0.3 ? grow : 1 - (age - 0.3) / (SPAWN_LIFETIME_S - 0.3);
     }
