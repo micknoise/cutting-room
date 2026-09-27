@@ -62,17 +62,25 @@
 // leans on a handful of these (picked most of the time, not exclusively
 // -- see pickShapeKind) so a "world" reads as a coherent family of forms
 // while still surprising you.
+// Each theme now owns a genuinely distinct hue (not just a slightly
+// different shade of dark blue-grey), a near-exclusive shape family (no
+// two themes share a shape kind, so silhouettes alone tell them apart),
+// and its own floor character -- a frequency multiplier on the terrain's
+// heightfield (broad slow dunes vs. choppy ridges) and its own fog
+// density (clear vs. hazy). Color, shape family, AND environment texture
+// all changing together is what makes a theme switch read as an actually
+// different "landscape" rather than a slightly-different tint.
 const THEMES = [
-  { name: 'Dunes', bg: 0x0a0a0d, line: 0x9099c9, glow: 0x4a5080, shapes: [0, 7, 3, 9] },
-  { name: 'Crystal Peaks', bg: 0x070a0d, line: 0xbfe3e0, glow: 0x3f7f78, shapes: [0, 2, 5, 10] },
-  { name: 'Deep Canyon', bg: 0x0a0810, line: 0xa37fc9, glow: 0x4a3560, shapes: [1, 6, 3, 9] },
-  { name: 'Frozen Ridge', bg: 0x080a0c, line: 0x9fc4d6, glow: 0x3a5566, shapes: [2, 3, 4, 8] },
-  { name: 'Dusk Fields', bg: 0x0a0810, line: 0xb98aa0, glow: 0x5c3648, shapes: [4, 7, 1, 10] },
-  { name: 'Still Water', bg: 0x06090a, line: 0x7fa89e, glow: 0x294844, shapes: [5, 4, 0, 8] },
+  { name: 'Dunes', bg: 0x0a0806, line: 0xd9a463, glow: 0x8a5a25, shapes: [3, 7], floorFreq: 0.7, fog: 0.00005 },
+  { name: 'Crystal Peaks', bg: 0x060a0c, line: 0x7fe0e8, glow: 0x2f8a92, shapes: [0, 2], floorFreq: 1.45, fog: 0.00004 },
+  { name: 'Deep Canyon', bg: 0x0a0610, line: 0xc86bdc, glow: 0x6b2b7a, shapes: [1, 6], floorFreq: 1.0, fog: 0.00009 },
+  { name: 'Frozen Ridge', bg: 0x06080c, line: 0xaad4ff, glow: 0x3f6fa0, shapes: [4, 10], floorFreq: 1.2, fog: 0.00006 },
+  { name: 'Dusk Fields', bg: 0x0a0608, line: 0xe0708a, glow: 0x8a2f42, shapes: [5, 9], floorFreq: 0.85, fog: 0.00008 },
+  { name: 'Still Water', bg: 0x060a08, line: 0x7fe0a8, glow: 0x2f8a58, shapes: [8], floorFreq: 0.5, fog: 0.00005 },
 ];
 const SHAPE_KINDS = ['ico', 'dodeca', 'octa', 'tetra', 'torus', 'torusKnot', 'box', 'cone', 'sphere', 'cylinder', 'ring'];
 function pickShapeKind(theme) {
-  if (theme && theme.shapes && theme.shapes.length && Math.random() < 0.7) {
+  if (theme && theme.shapes && theme.shapes.length && Math.random() < 0.88) {
     return theme.shapes[(Math.random() * theme.shapes.length) | 0];
   }
   return (Math.random() * SHAPE_KINDS.length) | 0;
@@ -108,12 +116,14 @@ const REF_BPM = 110;         // reference tempo the base motion rate is tuned ar
 const FLOOR_VS = `
   uniform float uTime;
   uniform float uAmp;
+  uniform float uFreqMul;
   varying float vDist;
   float heightAt(float x, float z) {
+    float fx = x * uFreqMul, fz = z * uFreqMul;
     float v = 0.0;
-    v += sin(x * 0.05 + z * 0.03 + uTime * 0.6) * 0.9;
-    v += sin(x * 0.11 - z * 0.05 - uTime * 0.9) * 0.35;
-    v += sin((x + z) * 0.02 + uTime * 0.25) * 1.6;
+    v += sin(fx * 0.05 + fz * 0.03 + uTime * 0.6) * 0.9;
+    v += sin(fx * 0.11 - fz * 0.05 - uTime * 0.9) * 0.35;
+    v += sin((fx + fz) * 0.02 + uTime * 0.25) * 1.6;
     return v * uAmp;
   }
   void main() {
@@ -263,7 +273,7 @@ class Landscape {
     this.camera = new THREE.PerspectiveCamera(62, 1, 0.1, 1400);
 
     this.floorMat = new THREE.ShaderMaterial({
-      uniforms: { uTime: { value: 0 }, uAmp: { value: 1.0 }, uColor: { value: new THREE.Color(0xffffff) },
+      uniforms: { uTime: { value: 0 }, uAmp: { value: 1.0 }, uFreqMul: { value: 1.0 }, uColor: { value: new THREE.Color(0xffffff) },
         uFog: { value: new THREE.Color(0x000000) }, uFogDensity: { value: 0.00006 } },
       vertexShader: FLOOR_VS, fragmentShader: LINE_FS,
     });
@@ -345,7 +355,13 @@ class Landscape {
       orbitRate: 0.15 + Math.random() * 0.35,
       swayAmp: 8 + Math.random() * 16,
       swayRate: 0.08 + Math.random() * 0.22,
-      spin: new THREE.Vector3((Math.random() - 0.5) * 5, (Math.random() - 0.5) * 5, (Math.random() - 0.5) * 5),
+      // Speed and direction are tracked separately (spinBase always
+      // positive, spinSign is the actual ±1 direction per axis) so a
+      // "direction change" can be a plain sign flip -- a visible reversal
+      // -- rather than a reroll to a new random vector that might
+      // coincidentally look like more of the same.
+      spinBase: new THREE.Vector3(0.6 + Math.random() * 2.4, 0.6 + Math.random() * 2.4, 0.6 + Math.random() * 2.4),
+      spinSign: new THREE.Vector3(Math.random() < 0.5 ? -1 : 1, Math.random() < 0.5 ? -1 : 1, Math.random() < 0.5 ? -1 : 1),
       beatPeriod: [2, 4, 8][(Math.random() * 3) | 0],
       beatOffset: 0,
       lastReshapeBeat: -1,
@@ -456,6 +472,7 @@ class Landscape {
     return {
       name: b.name, bg: rgbLerpHex(a.bg, b.bg, t), line: rgbLerpHex(a.line, b.line, t),
       glow: rgbLerpHex(a.glow, b.glow, t), shapes: t > 0.5 ? b.shapes : a.shapes,
+      floorFreq: lerp(a.floorFreq, b.floorFreq, t), fog: lerp(a.fog, b.fog, t),
     };
   }
 
@@ -489,13 +506,18 @@ class Landscape {
       this._spawnEvent();
       if (strength > 0.55) this._spawnEvent();
       if (strength > 0.85) this._spawnEvent();
-      // Reroll a random subset of the pool's rotation vectors on every
-      // hit -- distinct from the beat-quantized reshape below, this is
-      // what keeps rotation itself from ever settling into one fixed,
-      // "just spinning" direction/speed for the whole track.
+      // Flip rotation direction (sign, not magnitude -- a plain reroll can
+      // coincidentally still look like "more of the same") on a random
+      // subset of the pool on every hit -- distinct from the beat-
+      // quantized reshape below, this is what keeps rotation itself from
+      // ever settling into one fixed, "just spinning one way" for the
+      // whole track.
       for (const o of this.objects) {
-        if (Math.random() < 0.35) {
-          o.userData.spin.set((Math.random() - 0.5) * 6, (Math.random() - 0.5) * 6, (Math.random() - 0.5) * 6);
+        if (Math.random() < 0.4) {
+          const u = o.userData;
+          if (Math.random() < 0.6) u.spinSign.x *= -1;
+          if (Math.random() < 0.6) u.spinSign.y *= -1;
+          if (Math.random() < 0.6) u.spinSign.z *= -1;
         }
       }
     }
@@ -539,7 +561,7 @@ class Landscape {
     const radius = 2 + Math.random() * 2.5;
     const mat = new THREE.ShaderMaterial({
       uniforms: { uColor: { value: new THREE.Color(theme.glow) }, uFog: { value: new THREE.Color(theme.bg) },
-        uFogDensity: { value: 0.00006 }, uFFT: { value: this.fftTexture }, uDeform: { value: 0.8 }, uTime: { value: 0 } },
+        uFogDensity: { value: theme.fog || 0.00006 }, uFFT: { value: this.fftTexture }, uDeform: { value: 0.8 }, uTime: { value: 0 } },
       vertexShader: OBJECT_VS, fragmentShader: LINE_FS, transparent: true,
     });
     const mesh = new THREE.LineSegments(makeShapeGeometry(kind, radius), mat);
@@ -582,18 +604,26 @@ class Landscape {
     const dt = Math.min(0.05, (now - this.lastFrameTime) / 1000);
     this.lastFrameTime = now;
 
+    // Nothing here should move when there's no audio actually playing --
+    // "constant motion" (see header) was always about not going dead
+    // during a quiet passage of a *playing* track, never about animating
+    // with no sound at all. So: no audio features, no motion-clock
+    // advance, no rotation, no camera orbit, no shape deformation change
+    // while paused/idle -- the whole scene just sits exactly as it was.
+    const playing = !!(this.audioEl && this.track && !this.audioEl.paused);
     const currentTime = (this.audioEl && this.track) ? (this.audioEl.currentTime || 0) : 0;
-    if (this.audioEl && this.track && !this.audioEl.paused) {
+    if (playing) {
       this._maybeSwitchSection(currentTime);
+      this._updateAudioFeatures(dt);
     }
-    this._updateAudioFeatures(dt);
     if (this.themeBlend < 1) this.themeBlend = Math.min(1, (now - this.themeBlendStart) / 1200);
     const theme = this._blendedThemeSnapshot();
 
     // Tempo: a beat clock derived straight from the track's own BPM and
     // real playback position, independent of the motion clock -- see
     // header comment. Falls back to a plausible default before a track's
-    // BPM is known so nothing divides by zero.
+    // BPM is known so nothing divides by zero. Freezes on its own while
+    // paused, since currentTime itself doesn't advance.
     const bpm = (this.track && this.track.bpm) || REF_BPM;
     const beatSec = 60 / bpm;
     this.beatCount = Math.floor(currentTime / beatSec);
@@ -602,16 +632,19 @@ class Landscape {
     // The only place live audio energy touches anything continuous: how
     // fast the shared motion clock runs -- additionally scaled by tempo,
     // so a fast track feels more urgent throughout. Everything below
-    // reads its phase from motionT/dMotion at fixed amplitude.
-    const energy = this.bass * 0.6 + this.mid * 0.3 + this.treble * 0.1;
+    // reads its phase from motionT/dMotion at fixed amplitude. Zero while
+    // not playing, so motionT/flightDist simply hold their value.
+    const energy = playing ? (this.bass * 0.6 + this.mid * 0.3 + this.treble * 0.1) : 0;
     const bpmRatio = bpm / REF_BPM;
-    const motionRate = (0.35 + energy * 1.7 + this.designedIntensity * 0.25) * bpmRatio;
+    const motionRate = playing ? (0.35 + energy * 1.7 + this.designedIntensity * 0.25) * bpmRatio : 0;
     const dMotion = dt * motionRate;
     this.motionT += dMotion;
     this.flightDist += dMotion * 46;
 
-    this.objectMat.uniforms.uTime.value = now / 1000;
-    this.objectMat.uniforms.uDeform.value = 0.9 + this.designedIntensity * 1.0;
+    if (playing) {
+      this.objectMat.uniforms.uTime.value = now / 1000;
+      this.objectMat.uniforms.uDeform.value = 0.9 + this.designedIntensity * 1.0;
+    }
 
     this._updateWorld(dt, dMotion, theme, energy);
     this._render(theme);
@@ -649,9 +682,12 @@ class Landscape {
     this.floorMesh.position.x = cam.position.x;
     this.floorMat.uniforms.uTime.value = this.flightDist * 0.05;
     this.floorMat.uniforms.uAmp.value = 0.8 + this.designedIntensity * 0.9;
+    this.floorMat.uniforms.uFreqMul.value = theme.floorFreq;
+    this.floorMat.uniforms.uFogDensity.value = theme.fog;
     this.floorMat.uniforms.uColor.value.setHex(theme.line);
     this.floorMat.uniforms.uFog.value.setHex(theme.bg);
 
+    this.objectMat.uniforms.uFogDensity.value = theme.fog;
     this.objectMat.uniforms.uColor.value.setHex(theme.line);
     this.objectMat.uniforms.uFog.value.setHex(theme.bg);
 
@@ -660,9 +696,9 @@ class Landscape {
 
       // Continuous rotation -- the "dance" never stops, it just plays
       // faster or slower with dMotion (which is itself energy-scaled).
-      o.rotation.x += u.spin.x * dMotion;
-      o.rotation.y += u.spin.y * dMotion;
-      o.rotation.z += u.spin.z * dMotion;
+      o.rotation.x += u.spinBase.x * u.spinSign.x * dMotion;
+      o.rotation.y += u.spinBase.y * u.spinSign.y * dMotion;
+      o.rotation.z += u.spinBase.z * u.spinSign.z * dMotion;
 
       if (u.behavior === 'orbit') {
         o.position.x = u.centerX + Math.cos(motionT * u.orbitRate + u.bobPhase) * u.orbitRadius;
@@ -680,15 +716,23 @@ class Landscape {
 
       // The dance's reshape/explosion is quantized to this object's own
       // beat multiple (staggered via beatOffset so the pool doesn't all
-      // pop on the same beat) -- landing precisely on the track's real
-      // tempo grid, per the "more clearly linked to tempo" ask, rather
-      // than an arbitrary internally-timed cycle. The scale-burst envelope
-      // is likewise measured in beats-since-triggered, not motionT.
-      if (beatCount >= 0 && (beatCount - u.beatOffset) % u.beatPeriod === 0 && beatCount !== u.lastReshapeBeat) {
+      // pop on the same beat) -- landing on the track's real tempo grid --
+      // but ONLY actually fires once there's real energy above the local
+      // baseline right then (hasNoise), not on a bare metronome: a
+      // schedule with nothing behind it read as things shifting for no
+      // audible reason. It keeps checking every frame while the scheduled
+      // beat is current, so it fires the moment a hit lands within that
+      // beat, or simply sits out a beat with no real hit in it at all.
+      const hasNoise = this.bassFast > this.bassSlow * 1.12 + 0.015 && this.bassFast > 0.08;
+      if (beatCount >= 0 && (beatCount - u.beatOffset) % u.beatPeriod === 0 && beatCount !== u.lastReshapeBeat && hasNoise) {
         u.lastReshapeBeat = beatCount;
         this._reshapeObject(o, theme);
         const behaviors = ['bob', 'orbit', 'sway', 'still'];
         u.behavior = behaviors[(Math.random() * behaviors.length) | 0];
+        // A reshape is a "reset" -- give it a fresh rotation speed, and
+        // make the direction change definite rather than a coin flip.
+        u.spinBase.set(0.6 + Math.random() * 2.4, 0.6 + Math.random() * 2.4, 0.6 + Math.random() * 2.4);
+        u.spinSign.x *= -1; u.spinSign.y *= -1; u.spinSign.z *= -1;
       }
       const beatsSinceReshape = (beatCount - u.lastReshapeBeat) + beatPhase;
       const burstWindow = 0.35;
