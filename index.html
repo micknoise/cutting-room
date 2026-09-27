@@ -74,13 +74,16 @@
     color: var(--text); cursor: pointer; flex-shrink: 0;
   }
   .transport button:hover { border-color: var(--accent); color: var(--accent); }
+  #shuffleBtn[aria-pressed="true"] { border-color: var(--accent-2); color: var(--accent-2); background: rgba(107,143,138,0.12); }
   select {
     flex: 1; min-width: 0; font-family: inherit; font-size: 13px; padding: 9px 11px;
     border-radius: 10px; border: 1px solid var(--panel-border); background: rgba(224,228,232,0.06);
     color: var(--text);
   }
-  .toggles { display: flex; gap: 16px; font-size: 12px; color: var(--text-dim); }
+  .toggles { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; font-size: 12px; color: var(--text-dim); }
   .toggles label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+  .dl-link { color: var(--text-dim); text-decoration: none; border-bottom: 1px solid var(--panel-border); margin-left: auto; }
+  .dl-link:hover { color: var(--accent); border-color: var(--accent); }
   .hint {
     position: fixed; top: 18px; left: 50%; transform: translateX(-50%); z-index: 6;
     font-size: 12px; color: var(--text-dim); letter-spacing: 0.01em; text-align: center;
@@ -115,11 +118,13 @@
         <button id="prevBtn" title="Previous track" aria-label="Previous track">&larr;</button>
         <select id="trackSelect" aria-label="Choose a track"></select>
         <button id="nextBtn" title="Next track" aria-label="Next track">&rarr;</button>
+        <button id="shuffleBtn" title="Shuffle playback order" aria-label="Shuffle playback order" aria-pressed="false">shuffle</button>
       </div>
 
       <div class="toggles">
         <label><input type="checkbox" id="autoAdvance" checked> auto-advance</label>
         <label><input type="checkbox" id="loopPlaylist" checked> loop playlist</label>
+        <a id="downloadMix" class="dl-link" href="https://github.com/micknoise/cutting-room/releases/download/shuffled-mix-v1/Cutting.Room.-.Shuffled.Mix.100.pieces.mp4" download>download shuffled mix (all 100, one file)</a>
       </div>
     </div>
   </div>

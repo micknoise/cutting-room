@@ -14,9 +14,50 @@
   var autoAdvance = document.getElementById('autoAdvance');
   var loopPlaylist = document.getElementById('loopPlaylist');
   var startHint = document.getElementById('startHint');
+  var shuffleBtn = document.getElementById('shuffleBtn');
 
   var current = 0;
   var started = false;
+
+  // Shuffle mode keeps a fixed random permutation of all track indices,
+  // anchored at whatever was playing when shuffle was switched on, and
+  // walks through it with next/prev/auto-advance instead of the plain
+  // TRACKS order. loadTrack() re-syncs shufflePos whenever current changes
+  // by some other means (dropdown pick), so the two never drift apart.
+  var shuffleOn = false;
+  var shuffleOrder = [];
+  var shufflePos = 0;
+
+  function buildShuffleOrder(anchor) {
+    var rest = [];
+    for (var i = 0; i < TRACKS.length; i++) if (i !== anchor) rest.push(i);
+    for (var i = rest.length - 1; i > 0; i--) {
+      var j = Math.floor(Math.random() * (i + 1));
+      var tmp = rest[i]; rest[i] = rest[j]; rest[j] = tmp;
+    }
+    return [anchor].concat(rest);
+  }
+
+  function setShuffle(on) {
+    shuffleOn = on;
+    shuffleBtn.setAttribute('aria-pressed', String(on));
+    if (on) {
+      shuffleOrder = buildShuffleOrder(current);
+      shufflePos = 0;
+    }
+  }
+
+  function stepIndex(dir) {
+    if (shuffleOn) {
+      shufflePos = ((shufflePos + dir) % shuffleOrder.length + shuffleOrder.length) % shuffleOrder.length;
+      return shuffleOrder[shufflePos];
+    }
+    return current + dir;
+  }
+
+  function atEnd() {
+    return shuffleOn ? shufflePos === shuffleOrder.length - 1 : current === TRACKS.length - 1;
+  }
 
   function title(genre) {
     return genre.replace(/_/g, ' ').replace(/\b\w/g, function (c) { return c.toUpperCase(); }).replace('Dnb', 'DnB');
@@ -46,6 +87,10 @@
     var resolved = new URL(t.path, window.location.href).href;
     if (player.src !== resolved) player.src = t.path;
     select.value = String(current);
+    if (shuffleOn) {
+      var pos = shuffleOrder.indexOf(current);
+      shufflePos = pos === -1 ? 0 : pos;
+    }
     renderNowPlaying(t);
     landscape.setTrack(t);
     if (doPlay) {
@@ -111,17 +156,20 @@
   });
   document.getElementById('prevBtn').addEventListener('click', function () {
     begin();
-    loadTrack(current - 1, true);
+    loadTrack(stepIndex(-1), true);
   });
   document.getElementById('nextBtn').addEventListener('click', function () {
     begin();
-    loadTrack(current + 1, true);
+    loadTrack(stepIndex(1), true);
+  });
+  shuffleBtn.addEventListener('click', function () {
+    setShuffle(!shuffleOn);
   });
   player.addEventListener('play', begin);
   player.addEventListener('ended', function () {
     if (!autoAdvance.checked) return;
-    if (current === TRACKS.length - 1 && !loopPlaylist.checked) return;
-    loadTrack(current + 1, true);
+    if (atEnd() && !loopPlaylist.checked) return;
+    loadTrack(stepIndex(1), true);
   });
 })();
 
