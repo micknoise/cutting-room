@@ -1,157 +1,125 @@
-// Wireframe landscape, WebGL edition. Two things happen every frame:
-//  1. A perspective wireframe terrain grid (heightmap = a sum of travelling
-//     sine waves -- cheap, dependency-free, no noise library) scrolls
-//     toward the viewer forever.
-//  2. Audio "events" (onsets detected from the bass band -- a fast/slow
-//     energy envelope crossing a threshold) each punch out a expanding
-//     wireframe ring entity that grows, rotates and fades.
-// Both are just line segments -- the whole scene is ONE gl.LINES draw call
-// a frame. Motion trails are a GPU feedback effect (ping-pong framebuffers:
-// each frame, the previous frame's texture is faded toward the theme
-// background and the new lines are drawn additively on top), not a
-// per-object fade, so it's essentially free.
+// Wireframe world, three.js edition. Object-based, not one big bouncy
+// environment: the environment (a wireframe wave-floor) is mostly just
+// something to fly through at a steady, continuous drift, while discrete
+// wireframe objects (polyhedra) scattered through it are what actually
+// bounce/pulse with the bass, and each audio "event" (an onset detected
+// from the bass band) punches out one more of them near the flight path
+// that grows and dissolves. Motion trails are a GPU accumulation buffer
+// (render scene -> blend with last frame -> that becomes next frame's
+// "last") -- efficient, no per-object fade bookkeeping.
 //
-// Two inputs drive the terrain: the piece's own composed per-section
-// `intensity` (a slow "designed journey") and live Web Audio frequency
-// analysis of the actual sound (fast bass/mid/treble reactivity). A
-// "theme" (palette + terrain shape) is picked per song-form letter and
-// cross-fades in over ~1.2s whenever the section changes, so a repeated
-// letter always gets the same landscape.
+// Two inputs drive it throughout: the piece's own composed per-section
+// `intensity` (a slow "designed journey" -- flight speed, object density)
+// and live Web Audio frequency analysis of the actual sound (fast bass/
+// mid/treble reactivity -- object bob/pulse, onset spawns). A "theme"
+// (palette + which polyhedra shapes dominate) is picked per song-form
+// letter and cross-fades in over ~1.2s whenever the section changes, so a
+// repeated letter always gets the same world.
 
 const THEMES = [
-  { name: 'Dunes', bg: '#0a0a0d', line: '#9099c9', glow: '#4a5080',
-    octaves: [[0.05, 0.9, 0.6], [0.11, 0.35, -0.9], [0.021, 1.6, 0.25]], shape: 'identity', base: 0.0 },
-  { name: 'Crystal Peaks', bg: '#070a0d', line: '#bfe3e0', glow: '#3f7f78',
-    octaves: [[0.07, 1.1, 0.5], [0.16, 0.6, -0.7], [0.033, 0.8, 0.3]], shape: 'abs', base: 0.15 },
-  { name: 'Deep Canyon', bg: '#0a0810', line: '#a37fc9', glow: '#4a3560',
-    octaves: [[0.045, 1.3, 0.4], [0.09, 0.5, 0.8], [0.02, 0.7, -0.2]], shape: 'negabs', base: -0.1 },
-  { name: 'Frozen Ridge', bg: '#080a0c', line: '#9fc4d6', glow: '#3a5566',
-    octaves: [[0.06, 0.7, 0.35], [0.13, 0.45, -0.55], [0.028, 1.1, 0.15]], shape: 'identity', base: 0.05 },
-  { name: 'Dusk Fields', bg: '#0a0810', line: '#b98aa0', glow: '#5c3648',
-    octaves: [[0.08, 0.5, 0.7], [0.19, 0.3, -1.0], [0.04, 0.9, 0.4]], shape: 'abs', base: 0.0 },
-  { name: 'Still Water', bg: '#06090a', line: '#7fa89e', glow: '#294844',
-    octaves: [[0.03, 1.4, 0.2], [0.065, 0.5, 0.35], [0.14, 0.15, -0.6]], shape: 'identity', base: -0.05 },
+  { name: 'Dunes', bg: 0x0a0a0d, line: 0x9099c9, glow: 0x4a5080, shape: 0 },
+  { name: 'Crystal Peaks', bg: 0x070a0d, line: 0xbfe3e0, glow: 0x3f7f78, shape: 1 },
+  { name: 'Deep Canyon', bg: 0x0a0810, line: 0xa37fc9, glow: 0x4a3560, shape: 2 },
+  { name: 'Frozen Ridge', bg: 0x080a0c, line: 0x9fc4d6, glow: 0x3a5566, shape: 0 },
+  { name: 'Dusk Fields', bg: 0x0a0810, line: 0xb98aa0, glow: 0x5c3648, shape: 1 },
+  { name: 'Still Water', bg: 0x06090a, line: 0x7fa89e, glow: 0x294844, shape: 2 },
 ];
-
-function shapeHeight(kind, v) {
-  if (kind === 'abs') return Math.abs(v) * 1.3 - 0.5;
-  if (kind === 'negabs') return -Math.abs(v) * 1.3 + 0.3;
-  return v;
-}
+const SHAPE_KINDS = ['ico', 'dodeca', 'octa'];
 
 function lerp(a, b, t) { return a + (b - a) * t; }
-function toRgbArr(color) {
-  if (Array.isArray(color)) return color;
-  const h = color.replace('#', '');
-  return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)];
+function hexToRgb(hex) { return [(hex >> 16) & 255, (hex >> 8) & 255, hex & 255]; }
+function rgbLerpHex(hexA, hexB, t) {
+  const a = hexToRgb(hexA), b = hexToRgb(hexB);
+  const r = Math.round(lerp(a[0], b[0], t)), g = Math.round(lerp(a[1], b[1], t)), bl = Math.round(lerp(a[2], b[2], t));
+  return (r << 16) | (g << 8) | bl;
 }
-function rgbLerpArr(colorA, colorB, t) {
-  const a = toRgbArr(colorA), b = toRgbArr(colorB);
-  return [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)];
-}
-
-// A small deterministic string hash -> picks the same theme for the same
-// (genre, letter) every time, so a repeated song-form letter within one
-// piece always gets the same landscape, echoing the generator's own
-// "repeated sections reuse the same identity" rule.
+// Deterministic string hash -> same theme for the same (genre, letter)
+// every time, so a repeated song-form letter always gets the same world.
 function hashStr(s) {
   let h = 0;
-  for (let i = 0; i < s.length; i++) { h = (h * 31 + s.charCodeAt(i)) | 0; }
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
   return Math.abs(h);
 }
 
-function compileShader(gl, type, src) {
-  const sh = gl.createShader(type);
-  gl.shaderSource(sh, src);
-  gl.compileShader(sh);
-  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
-    const log = gl.getShaderInfoLog(sh);
-    gl.deleteShader(sh);
-    throw new Error('shader compile failed: ' + log);
-  }
-  return sh;
-}
-function linkProgram(gl, vsSrc, fsSrc) {
-  const vs = compileShader(gl, gl.VERTEX_SHADER, vsSrc);
-  const fs = compileShader(gl, gl.FRAGMENT_SHADER, fsSrc);
-  const prog = gl.createProgram();
-  gl.attachShader(prog, vs);
-  gl.attachShader(prog, fs);
-  gl.linkProgram(prog);
-  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
-    const log = gl.getProgramInfoLog(prog);
-    throw new Error('program link failed: ' + log);
-  }
-  return prog;
-}
+const FLOOR_SPAN = 260;      // world units square the floor grid covers
+const FLOOR_SEG = 44;        // grid divisions per side
+const OBJECT_SPAN = 420;     // world-Z depth objects are spread/recycled across
+const OBJECT_COUNT = 16;
+const SPAWN_LIFETIME_S = 1.3;
+const ONSET_RATIO = 1.32;
+const ONSET_REFRACTORY_S = 0.16;
 
-const LINE_VS = `
-  attribute vec2 aPos;
-  attribute vec3 aColor;
-  attribute float aAlpha;
-  uniform vec2 uResolution;
-  varying vec3 vColor;
-  varying float vAlpha;
+const FLOOR_VS = `
+  uniform float uTime;
+  uniform float uAmp;
+  varying float vDist;
+  float heightAt(float x, float z) {
+    float v = 0.0;
+    v += sin(x * 0.05 + z * 0.03 + uTime * 0.6) * 0.9;
+    v += sin(x * 0.11 - z * 0.05 - uTime * 0.9) * 0.35;
+    v += sin((x + z) * 0.02 + uTime * 0.25) * 1.6;
+    return v * uAmp;
+  }
   void main() {
-    vec2 clip = (aPos / uResolution) * 2.0 - 1.0;
-    clip.y = -clip.y;
-    gl_Position = vec4(clip, 0.0, 1.0);
-    vColor = aColor;
-    vAlpha = aAlpha;
+    vec3 p = position;
+    p.y = heightAt(p.x, p.z + uTime * 0.0);
+    vDist = length((modelViewMatrix * vec4(p, 1.0)).xyz);
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
   }
 `;
 const LINE_FS = `
   precision mediump float;
-  varying vec3 vColor;
-  varying float vAlpha;
+  uniform vec3 uColor;
+  uniform vec3 uFog;
+  uniform float uFogDensity;
+  varying float vDist;
   void main() {
-    gl_FragColor = vec4(vColor * vAlpha, vAlpha);
+    float fog = 1.0 - exp(-uFogDensity * vDist * vDist);
+    gl_FragColor = vec4(mix(uColor, uFog, clamp(fog, 0.0, 1.0)), 1.0);
   }
 `;
+// Same fog treatment for ordinary (non-shader-displaced) LineSegments
+// objects -- a plain onBeforeCompile-free approach: a tiny custom material
+// reusing the same fragment shader, fed a flat vertex shader.
+const PLAIN_VS = `
+  varying float vDist;
+  void main() {
+    vDist = length((modelViewMatrix * vec4(position, 1.0)).xyz);
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  }
+`;
+
+// Fullscreen accumulation/trail shader: blends the freshly rendered scene
+// texture over the previous accumulated frame, fading the latter toward
+// the theme background -- the trail, as one cheap full-screen pass.
 const QUAD_VS = `
-  attribute vec2 aPos;
   varying vec2 vUv;
-  void main() {
-    vUv = aPos * 0.5 + 0.5;
-    gl_Position = vec4(aPos, 0.0, 1.0);
-  }
+  void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }
 `;
-// Simple GLSL blend: mixes the previous frame's texture toward the theme
-// background colour by uDecay each frame (the trail/persistence effect --
-// a cheap GPU feedback loop instead of per-object fade bookkeeping).
 const QUAD_FS = `
   precision mediump float;
   varying vec2 vUv;
-  uniform sampler2D uTex;
-  uniform float uDecay;
+  uniform sampler2D tPrev;
+  uniform sampler2D tCur;
   uniform vec3 uBg;
+  uniform float uDecay;
   void main() {
-    vec3 c = texture2D(uTex, vUv).rgb;
-    gl_FragColor = vec4(mix(uBg, c, uDecay), 1.0);
+    vec3 prev = mix(uBg, texture2D(tPrev, vUv).rgb, uDecay);
+    vec3 cur = texture2D(tCur, vUv).rgb;
+    gl_FragColor = vec4(max(prev, cur), 1.0);
   }
 `;
 
-// A ring entity template (unit circle, N segments) -- each spawned entity
-// is just a transform (center, scale, rotation) applied to these points at
-// draw time, so spawning one costs nothing beyond a small object push.
-const RING_SEGMENTS = 22;
-const RING_PTS = [];
-for (let i = 0; i < RING_SEGMENTS; i++) {
-  const a = (i / RING_SEGMENTS) * Math.PI * 2;
-  RING_PTS.push([Math.cos(a), Math.sin(a)]);
+function makeShapeGeometry(kind, radius) {
+  const src = kind === 0 ? new THREE.IcosahedronGeometry(radius, 0)
+    : kind === 1 ? new THREE.DodecahedronGeometry(radius, 0)
+    : new THREE.OctahedronGeometry(radius, 0);
+  return new THREE.EdgesGeometry(src);
 }
-
-const ENTITY_LIFETIME_S = 0.85;
-// Onset detection: a fast envelope (~instant) vs a slow one (~0.5s) on the
-// bass band -- an "event" fires when fast pulls far enough ahead of slow,
-// with a short refractory window so one hit can't retrigger mid-attack.
-const ONSET_RATIO = 1.32;
-const ONSET_REFRACTORY_S = 0.16;
 
 class Landscape {
   constructor(canvas) {
     this.canvas = canvas;
-    this.gl = canvas.getContext('webgl', { antialias: true, alpha: false });
     this.audioEl = null;
     this.audioCtx = null;
     this.analyser = null;
@@ -159,9 +127,9 @@ class Landscape {
     this.bass = 0; this.mid = 0; this.treble = 0;
     this.bassFast = 0; this.bassSlow = 0;
     this.lastSpawn = -Infinity;
-    this.entities = [];
+    this.spawned = [];
     this.lastFrameTime = performance.now();
-    this.scrollZ = 0;
+    this.flightDist = 0;
 
     this.track = null;
     this.sectionStarts = [];
@@ -173,82 +141,111 @@ class Landscape {
     this.themeBlendStart = 0;
     this.designedIntensity = 0.4;
 
-    this._initGL();
+    this._initScene();
     this._resize();
     window.addEventListener('resize', () => this._resize());
     this._raf = requestAnimationFrame((t) => this._loop(t));
   }
 
-  _initGL() {
-    const gl = this.gl;
-    this.lineProg = linkProgram(gl, LINE_VS, LINE_FS);
-    this.quadProg = linkProgram(gl, QUAD_VS, QUAD_FS);
+  _initScene() {
+    const renderer = new THREE.WebGLRenderer({ canvas: this.canvas, antialias: true, alpha: false });
+    renderer.setClearColor(0x000000, 1);
+    this.renderer = renderer;
 
-    this.lineLoc = {
-      aPos: gl.getAttribLocation(this.lineProg, 'aPos'),
-      aColor: gl.getAttribLocation(this.lineProg, 'aColor'),
-      aAlpha: gl.getAttribLocation(this.lineProg, 'aAlpha'),
-      uResolution: gl.getUniformLocation(this.lineProg, 'uResolution'),
+    this.scene = new THREE.Scene();
+    this.camera = new THREE.PerspectiveCamera(62, 1, 0.1, 1400);
+
+    this.floorMat = new THREE.ShaderMaterial({
+      uniforms: { uTime: { value: 0 }, uAmp: { value: 1.0 }, uColor: { value: new THREE.Color(0xffffff) },
+        uFog: { value: new THREE.Color(0x000000) }, uFogDensity: { value: 0.00006 } },
+      vertexShader: FLOOR_VS, fragmentShader: LINE_FS,
+    });
+    this.floorMesh = new THREE.LineSegments(this._buildFloorGeometry(), this.floorMat);
+    this.floorMesh.frustumCulled = false;
+    this.scene.add(this.floorMesh);
+
+    this.objectMat = new THREE.ShaderMaterial({
+      uniforms: { uColor: { value: new THREE.Color(0xffffff) }, uFog: { value: new THREE.Color(0x000000) },
+        uFogDensity: { value: 0.00006 } },
+      vertexShader: PLAIN_VS, fragmentShader: LINE_FS,
+    });
+
+    this.objects = [];
+    for (let i = 0; i < OBJECT_COUNT; i++) this.objects.push(this._makeObject(true));
+
+    this.spawnGroup = new THREE.Group();
+    this.scene.add(this.spawnGroup);
+
+    // Trail/accumulation buffers.
+    this.sceneRT = new THREE.WebGLRenderTarget(2, 2, { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter });
+    this.accumRT = [
+      new THREE.WebGLRenderTarget(2, 2, { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter }),
+      new THREE.WebGLRenderTarget(2, 2, { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter }),
+    ];
+    this.accumIdx = 0;
+    this.quadScene = new THREE.Scene();
+    this.quadCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+    this.quadMat = new THREE.ShaderMaterial({
+      uniforms: { tPrev: { value: null }, tCur: { value: null }, uBg: { value: new THREE.Color(0x000000) }, uDecay: { value: 0.86 } },
+      vertexShader: QUAD_VS, fragmentShader: QUAD_FS, depthTest: false, depthWrite: false,
+    });
+    const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.quadMat);
+    quad.frustumCulled = false;
+    this.quadScene.add(quad);
+  }
+
+  _buildFloorGeometry() {
+    const seg = FLOOR_SEG, span = FLOOR_SPAN;
+    const pts = [];
+    for (let i = 0; i <= seg; i++) {
+      const x = (i / seg - 0.5) * span;
+      pts.push(x, 0, -span / 2, x, 0, span / 2);
+    }
+    for (let j = 0; j <= seg; j++) {
+      const z = (j / seg - 0.5) * span;
+      pts.push(-span / 2, 0, z, span / 2, 0, z);
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+    return geo;
+  }
+
+  _makeObject(randomizeZ) {
+    const kind = (Math.random() * 3) | 0;
+    const radius = 4 + Math.random() * 9;
+    const mesh = new THREE.LineSegments(makeShapeGeometry(kind, radius), this.objectMat);
+    mesh.frustumCulled = false;
+    mesh.userData = {
+      kind,
+      baseY: 6 + Math.random() * 22,
+      bobAmp: 1.5 + Math.random() * 3,
+      bobRate: 0.3 + Math.random() * 0.5,
+      bobPhase: Math.random() * Math.PI * 2,
+      spin: new THREE.Vector3((Math.random() - 0.5) * 0.25, (Math.random() - 0.5) * 0.25, (Math.random() - 0.5) * 0.25),
     };
-    this.quadLoc = {
-      aPos: gl.getAttribLocation(this.quadProg, 'aPos'),
-      uTex: gl.getUniformLocation(this.quadProg, 'uTex'),
-      uDecay: gl.getUniformLocation(this.quadProg, 'uDecay'),
-      uBg: gl.getUniformLocation(this.quadProg, 'uBg'),
-    };
-
-    this.quadBuf = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuf);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
-
-    this.lineBuf = gl.createBuffer();
-
-    // The trail feedback effect needs only ONE extra texture (not a full
-    // ping-pong pair of framebuffers): each frame renders straight to the
-    // visible canvas (fade pass + lines), then a single cheap
-    // gl.copyTexImage2D grabs that same visible framebuffer into this
-    // texture to serve as "previous frame" for the next fade pass. That
-    // replaces a whole extra textured full-screen draw+shader pass (a
-    // "blit to screen" step) with a raw pixel copy -- no shader
-    // invocation, the cheapest way the GPU can move a screen's worth of
-    // pixels.
-    this.prevTex = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, this.prevTex);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    mesh.position.set((Math.random() - 0.5) * 140, mesh.userData.baseY,
+      -(randomizeZ ? Math.random() * OBJECT_SPAN : 0));
+    this.scene.add(mesh);
+    return mesh;
   }
 
   _resize() {
-    // Capped below the usual 2x/3x retina factor: fragment cost scales with
-    // the *square* of this (2x = 4x the pixels), and a background wireframe
-    // gains little visible sharpness past ~1.5x while paying a lot for it.
     const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
-    const w = Math.floor(window.innerWidth * dpr);
-    const h = Math.floor(window.innerHeight * dpr);
-    this.canvas.width = w;
-    this.canvas.height = h;
-    this.dpr = dpr;
-    this.gl.viewport(0, 0, w, h);
-    // Re-seed the "previous frame" texture at the new size (blank -- one
-    // faded-from-black frame on resize is invisible in practice).
-    const gl = this.gl;
-    gl.bindTexture(gl.TEXTURE_2D, this.prevTex);
-    // RGB, not RGBA: the context below is created with alpha:false, so the
-    // default framebuffer has no alpha channel at all. copyTexImage2D
-    // (used every frame in _draw) requesting RGBA against an alpha-less
-    // framebuffer is a format mismatch that fails with GL_INVALID_OPERATION
-    // -- silently (WebGL errors don't throw), so the trail texture was
-    // never actually being updated. The fade shader only ever reads
-    // .rgb anyway, so RGB is also simply the correct format to ask for.
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, w, h, 0, gl.RGB, gl.UNSIGNED_BYTE, null);
+    const w = Math.max(1, Math.floor(window.innerWidth));
+    const h = Math.max(1, Math.floor(window.innerHeight));
+    this.renderer.setPixelRatio(dpr);
+    this.renderer.setSize(w, h, false);
+    this.camera.aspect = w / h;
+    this.camera.updateProjectionMatrix();
+    const pw = Math.max(1, Math.floor(w * dpr)), ph = Math.max(1, Math.floor(h * dpr));
+    this.sceneRT.setSize(pw, ph);
+    this.accumRT[0].setSize(pw, ph);
+    this.accumRT[1].setSize(pw, ph);
   }
 
   // Bind the single persistent <audio> element once. createMediaElementSource
   // can only be called once per element ever, and doesn't itself need a user
-  // gesture (only audioCtx.resume() does), so this is safe to call as soon
-  // as the element exists.
+  // gesture (only audioCtx.resume() does), so this is safe on load.
   bindAudio(audioEl) {
     if (this.audioEl === audioEl) return;
     this.audioEl = audioEl;
@@ -274,12 +271,12 @@ class Landscape {
     let t = 0;
     (track.sections || []).forEach((s) => {
       this.sectionStarts.push(t);
-      const idx = hashStr(track.genre + ':' + s.letter) % THEMES.length;
-      this.sectionThemeIdx.push(idx);
+      this.sectionThemeIdx.push(hashStr(track.genre + ':' + s.letter) % THEMES.length);
       t += s.seconds;
     });
     this.curSectionIdx = -1;
-    this.entities = [];
+    for (const s of this.spawned) this._disposeSpawn(s);
+    this.spawned = [];
     this._maybeSwitchSection(0);
   }
 
@@ -292,7 +289,7 @@ class Landscape {
     if (idx !== this.curSectionIdx) {
       this.curSectionIdx = idx;
       const theme = THEMES[this.sectionThemeIdx[idx]];
-      this.themeFrom = this._currentBlendedTheme();
+      this.themeFrom = this._blendedThemeSnapshot();
       this.themeTo = theme;
       this.themeBlend = 0;
       this.themeBlendStart = performance.now();
@@ -303,13 +300,11 @@ class Landscape {
     }
   }
 
-  _currentBlendedTheme() {
+  _blendedThemeSnapshot() {
     const a = this.themeFrom, b = this.themeTo, t = this.themeBlend;
     return {
-      name: b.name, bg: rgbLerpArr(a.bg, b.bg, t), line: rgbLerpArr(a.line, b.line, t),
-      glow: rgbLerpArr(a.glow, b.glow, t),
-      octaves: b.octaves.map((o, i) => o.map((v, j) => lerp((a.octaves[i] || o)[j], v, t))),
-      shape: t > 0.5 ? b.shape : a.shape, base: lerp(a.base, b.base, t),
+      name: b.name, bg: rgbLerpHex(a.bg, b.bg, t), line: rgbLerpHex(a.line, b.line, t),
+      glow: rgbLerpHex(a.glow, b.glow, t), shape: t > 0.5 ? b.shape : a.shape,
     };
   }
 
@@ -323,39 +318,49 @@ class Landscape {
     for (let i = 0; i < bassEnd; i++) bass += this.freqData[i];
     for (let i = bassEnd; i < midEnd; i++) mid += this.freqData[i];
     for (let i = midEnd; i < n; i++) treble += this.freqData[i];
-    bass = bass / bassEnd / 255;
-    mid = mid / (midEnd - bassEnd) / 255;
-    treble = treble / (n - midEnd) / 255;
-
+    bass = bass / bassEnd / 255; mid = mid / (midEnd - bassEnd) / 255; treble = treble / (n - midEnd) / 255;
     const k = 0.18;
     this.bass += (bass - this.bass) * k;
     this.mid += (mid - this.mid) * k;
     this.treble += (treble - this.treble) * k;
 
-    // Onset detector: a fast envelope tracks the instantaneous bass energy
-    // closely, a slow one only drifts toward it -- when the fast one pulls
-    // far enough ahead (a sudden hit), that's an "event".
     this.bassFast += (bass - this.bassFast) * Math.min(1, dt * 14);
     this.bassSlow += (bass - this.bassSlow) * Math.min(1, dt * 2.2);
     const now = performance.now() / 1000;
-    if (this.bassFast > this.bassSlow * ONSET_RATIO + 0.03
-        && this.bassFast > 0.18
+    if (this.bassFast > this.bassSlow * ONSET_RATIO + 0.03 && this.bassFast > 0.18
         && now - this.lastSpawn > ONSET_REFRACTORY_S) {
       this.lastSpawn = now;
-      this._spawnEntity();
+      this._spawnEvent();
     }
   }
 
-  _spawnEntity() {
-    if (this.entities.length > 10) this.entities.shift();
-    this.entities.push({
-      x: (Math.random() * 0.7 + 0.15), // fraction of canvas width
-      y: (Math.random() * 0.35 + 0.08), // fraction of canvas height (upper region)
-      rot0: Math.random() * Math.PI * 2,
-      spin: (Math.random() < 0.5 ? -1 : 1) * (0.6 + Math.random() * 1.2),
-      born: performance.now() / 1000,
-      hue: Math.random(),
+  // Each audio "event" punches out a wireframe polyhedron near the flight
+  // path: it grows in, then dissolves (opacity fade) and is disposed.
+  _spawnEvent() {
+    if (this.spawned.length > 8) this._disposeSpawn(this.spawned.shift());
+    const theme = this._blendedThemeSnapshot();
+    const kind = (Math.random() * 3) | 0;
+    const radius = 2 + Math.random() * 2.5;
+    const mat = new THREE.ShaderMaterial({
+      uniforms: { uColor: { value: new THREE.Color(theme.glow) }, uFog: { value: new THREE.Color(theme.bg) },
+        uFogDensity: { value: 0.00006 } },
+      vertexShader: PLAIN_VS, fragmentShader: LINE_FS, transparent: true,
     });
+    const mesh = new THREE.LineSegments(makeShapeGeometry(kind, radius), mat);
+    mesh.frustumCulled = false;
+    const ahead = 40 + Math.random() * 30;
+    mesh.position.set(this.camera.position.x + (Math.random() - 0.5) * 30,
+      6 + Math.random() * 16, this.camera.position.z - ahead);
+    mesh.scale.setScalar(0.05);
+    this.spawnGroup.add(mesh);
+    this.spawned.push({ mesh, mat, born: performance.now() / 1000,
+      spin: new THREE.Vector3((Math.random() - 0.5) * 1.2, (Math.random() - 0.5) * 1.2, (Math.random() - 0.5) * 1.2) });
+  }
+
+  _disposeSpawn(s) {
+    this.spawnGroup.remove(s.mesh);
+    s.mesh.geometry.dispose();
+    s.mat.dispose();
   }
 
   _loop(now) {
@@ -367,154 +372,97 @@ class Landscape {
       this._maybeSwitchSection(this.audioEl.currentTime || 0);
     }
     this._updateAudioFeatures(dt);
+    if (this.themeBlend < 1) this.themeBlend = Math.min(1, (now - this.themeBlendStart) / 1200);
+    const theme = this._blendedThemeSnapshot();
 
-    if (this.themeBlend < 1) {
-      this.themeBlend = Math.min(1, (now - this.themeBlendStart) / 1200);
-    }
-    const theme = this._currentBlendedTheme();
     const energy = this.bass * 0.6 + this.mid * 0.3 + this.treble * 0.1;
-    const speed = 1.4 + energy * 3.2 + this.designedIntensity * 1.4;
-    this.scrollZ += speed * dt;
+    const speed = 9 + energy * 22 + this.designedIntensity * 10;
+    this.flightDist += speed * dt;
 
-    this._draw(theme, energy, now / 1000);
+    this._updateWorld(dt, now / 1000, theme, energy, speed);
+    this._render(theme);
   }
 
-  _buildVertices(theme, energy, nowS) {
-    const w = this.canvas.width, h = this.canvas.height;
-    const cols = 38, rows = 18;
-    const dx = 0.85;
-    const zNear = 5.0, zFar = 34.0;
-    const camY = 0.25 + this.designedIntensity * 0.35;
-    const focal = 1.3;
-    const centerX = w / 2, centerY = h * 0.46;
-    const ampBase = 0.85 + this.designedIntensity * 0.75;
-    const ampAudio = 1.0 + this.bass * 1.8 + this.mid * 0.6;
+  _updateWorld(dt, nowS, theme, energy, speed) {
+    const cam = this.camera;
+    // Continuous forward flight, with a gentle autonomous drift for an
+    // organic "fly around" feel rather than a dead-straight line.
+    cam.position.z = -this.flightDist;
+    cam.position.x = Math.sin(nowS * 0.09) * 14 + Math.sin(nowS * 0.021) * 26;
+    // Kept low and close to the floor ("eye just above the surface") --
+    // at the earlier height (~8-12 units) with a shallow downward tilt,
+    // the floor sat almost entirely below the visible frustum and never
+    // actually showed as a grid. Low eye height + a real downward tilt is
+    // what makes a wide, receding wireframe floor with objects clearly
+    // floating *above* it, rather than eye-level clutter.
+    cam.position.y = 3.2 + Math.sin(nowS * 0.05) * 0.6 + this.designedIntensity * 0.8;
+    const lookX = cam.position.x + Math.sin(nowS * 0.09 + 0.3) * 10;
+    const lookZ = cam.position.z - 60;
+    cam.up.set(0, 1, 0);
+    cam.lookAt(lookX, cam.position.y - 9, lookZ);
 
-    const heightAt = (x, z) => {
-      let v = theme.base;
-      for (const [freq, amp, speedMul] of theme.octaves) {
-        v += Math.sin(x * freq + z * freq * 0.6 + this.scrollZ * speedMul) * amp;
-      }
-      return shapeHeight(theme.shape, v) * ampBase * ampAudio;
-    };
+    this.floorMesh.position.z = cam.position.z;
+    this.floorMesh.position.x = cam.position.x;
+    this.floorMat.uniforms.uTime.value = this.flightDist * 0.05;
+    this.floorMat.uniforms.uAmp.value = 0.8 + this.designedIntensity * 0.9 + this.bass * 1.4;
+    this.floorMat.uniforms.uColor.value.setHex(theme.line);
+    this.floorMat.uniforms.uFog.value.setHex(theme.bg);
 
-    const pts = [];
-    for (let r = 0; r < rows; r++) {
-      const z = zNear + (r / (rows - 1)) * (zFar - zNear);
-      const worldZSample = z + this.scrollZ;
-      const row = [];
-      const scale = (focal * Math.min(w, h)) / z;
-      const fade = Math.max(0.06, 1 - r / rows);
-      for (let c = 0; c < cols; c++) {
-        const x = (c - (cols - 1) / 2) * dx;
-        const relY = heightAt(x, worldZSample) - camY;
-        row.push([centerX + x * scale, centerY + relY * scale, fade]);
-      }
-      pts.push(row);
-    }
+    this.objectMat.uniforms.uColor.value.setHex(theme.line);
+    this.objectMat.uniforms.uFog.value.setHex(theme.bg);
 
-    const [lr, lg, lb] = theme.line;
-    const cr = lr / 255, cg = lg / 255, cb = lb / 255;
-    const verts = [];
-    const pushSeg = (x0, y0, a0, x1, y1, a1, r, g, b) => {
-      verts.push(x0, y0, r, g, b, a0, x1, y1, r, g, b, a1);
-    };
-
-    for (let r = 0; r < rows; r++) {
-      for (let c = 0; c < cols - 1; c++) {
-        const [x0, y0, a0] = pts[r][c], [x1, y1, a1] = pts[r][c + 1];
-        pushSeg(x0, y0, a0 * 0.9, x1, y1, a1 * 0.9, cr, cg, cb);
-      }
-    }
-    for (let c = 0; c < cols; c++) {
-      for (let r = 0; r < rows - 1; r++) {
-        const [x0, y0, a0] = pts[r][c], [x1, y1, a1] = pts[r + 1][c];
-        pushSeg(x0, y0, a0 * 0.9, x1, y1, a1 * 0.9, cr, cg, cb);
+    const bounce = 0.5 + this.bass * 2.2;
+    for (const o of this.objects) {
+      const u = o.userData;
+      o.rotation.x += u.spin.x * dt; o.rotation.y += u.spin.y * dt; o.rotation.z += u.spin.z * dt;
+      o.position.y = u.baseY + Math.sin(nowS * u.bobRate + u.bobPhase) * u.bobAmp * bounce;
+      // Recycle objects that have drifted behind the camera back out ahead,
+      // so a fixed small pool reads as an endless field of forms.
+      if (o.position.z > cam.position.z + 30) {
+        o.position.z -= OBJECT_SPAN;
+        o.position.x = cam.position.x + (Math.random() - 0.5) * 140;
       }
     }
 
-    // Event entities: expanding, rotating, fading wireframe rings -- each
-    // audio "event" (see _updateAudioFeatures's onset detector) punches one
-    // of these out. Brightened relative to the terrain so they pop.
-    const [gr, gg, gb] = theme.glow;
-    const er = Math.min(1, cr * 1.3 + 0.15), eg = Math.min(1, cg * 1.3 + 0.15), eb = Math.min(1, cb * 1.3 + 0.15);
-    this.entities = this.entities.filter((e) => nowS - e.born < ENTITY_LIFETIME_S);
-    for (const e of this.entities) {
-      const age = (nowS - e.born) / ENTITY_LIFETIME_S; // 0..1
-      const alpha = (1 - age) * 0.85;
-      const scale = (0.03 + age * 0.22) * Math.min(w, h);
-      const rot = e.rot0 + e.spin * (nowS - e.born);
-      const cx = e.x * w, cy = e.y * h;
-      const cosr = Math.cos(rot), sinr = Math.sin(rot);
-      for (let i = 0; i < RING_SEGMENTS; i++) {
-        const [ux0, uy0] = RING_PTS[i];
-        const [ux1, uy1] = RING_PTS[(i + 1) % RING_SEGMENTS];
-        const x0 = cx + (ux0 * cosr - uy0 * sinr) * scale;
-        const y0 = cy + (ux0 * sinr + uy0 * cosr) * scale;
-        const x1 = cx + (ux1 * cosr - uy1 * sinr) * scale;
-        const y1 = cy + (ux1 * sinr + uy1 * cosr) * scale;
-        pushSeg(x0, y0, alpha, x1, y1, alpha, er, eg, eb);
-      }
-      // A couple of cheap radial spokes so it reads as a "burst", not just a ring.
-      for (let i = 0; i < 4; i++) {
-        const a = rot + (i / 4) * Math.PI * 2;
-        const x1 = cx + Math.cos(a) * scale * 1.4;
-        const y1 = cy + Math.sin(a) * scale * 1.4;
-        pushSeg(cx, cy, 0, x1, y1, alpha * 0.6, gr / 255, gg / 255, gb / 255);
-      }
+    for (let i = this.spawned.length - 1; i >= 0; i--) {
+      const s = this.spawned[i];
+      const age = nowS - s.born;
+      if (age > SPAWN_LIFETIME_S) { this._disposeSpawn(s); this.spawned.splice(i, 1); continue; }
+      const growT = Math.min(1, age / 0.3);
+      const grow = growT * growT * (3 - 2 * growT);
+      s.mesh.scale.setScalar(0.05 + grow * 1.3);
+      s.mesh.rotation.x += s.spin.x * dt; s.mesh.rotation.y += s.spin.y * dt; s.mesh.rotation.z += s.spin.z * dt;
+      s.mat.opacity = age < 0.3 ? grow : 1 - (age - 0.3) / (SPAWN_LIFETIME_S - 0.3);
     }
-
-    return new Float32Array(verts);
   }
 
-  _draw(theme, energy, nowS) {
-    const gl = this.gl;
-    const w = this.canvas.width, h = this.canvas.height;
-    const verts = this._buildVertices(theme, energy, nowS);
-    const vertCount = verts.length / 6;
+  _render(theme) {
+    const renderer = this.renderer;
+    renderer.autoClear = true;
+    renderer.setRenderTarget(this.sceneRT);
+    renderer.setClearColor(theme.bg, 1);
+    renderer.clear();
+    renderer.render(this.scene, this.camera);
 
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.viewport(0, 0, w, h);
-    gl.disable(gl.BLEND);
+    const writeIdx = 1 - this.accumIdx;
+    this.quadMat.uniforms.tPrev.value = this.accumRT[this.accumIdx].texture;
+    this.quadMat.uniforms.tCur.value = this.sceneRT.texture;
+    this.quadMat.uniforms.uBg.value.setHex(theme.bg);
+    this.quadMat.uniforms.uDecay.value = 0.86;
+    renderer.setRenderTarget(this.accumRT[writeIdx]);
+    renderer.clear();
+    renderer.render(this.quadScene, this.quadCamera);
 
-    // Pass 1: fade the previous frame (captured below) toward the theme
-    // background -- the trail, a full-screen GLSL blend rather than
-    // per-object fade bookkeeping. Drawn straight to the visible canvas.
-    gl.useProgram(this.quadProg);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuf);
-    gl.enableVertexAttribArray(this.quadLoc.aPos);
-    gl.vertexAttribPointer(this.quadLoc.aPos, 2, gl.FLOAT, false, 0, 0);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.prevTex);
-    gl.uniform1i(this.quadLoc.uTex, 0);
-    gl.uniform1f(this.quadLoc.uDecay, 0.90);
-    gl.uniform3f(this.quadLoc.uBg, theme.bg[0] / 255, theme.bg[1] / 255, theme.bg[2] / 255);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    renderer.setRenderTarget(null);
+    renderer.clear();
+    // Blit: reuse the same quad material/pass with decay=0 (pure copy of
+    // "cur", which is exactly what we just wrote into accumRT[writeIdx]).
+    this.quadMat.uniforms.tPrev.value = this.accumRT[writeIdx].texture;
+    this.quadMat.uniforms.tCur.value = this.accumRT[writeIdx].texture;
+    this.quadMat.uniforms.uDecay.value = 0;
+    renderer.render(this.quadScene, this.quadCamera);
 
-    // Pass 2: draw this frame's lines additively on top (sharp, glows where
-    // segments overlap -- no native shadow/blur needed).
-    gl.enable(gl.BLEND);
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
-    gl.useProgram(this.lineProg);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.lineBuf);
-    gl.bufferData(gl.ARRAY_BUFFER, verts, gl.DYNAMIC_DRAW);
-    const stride = 6 * 4;
-    gl.enableVertexAttribArray(this.lineLoc.aPos);
-    gl.vertexAttribPointer(this.lineLoc.aPos, 2, gl.FLOAT, false, stride, 0);
-    gl.enableVertexAttribArray(this.lineLoc.aColor);
-    gl.vertexAttribPointer(this.lineLoc.aColor, 3, gl.FLOAT, false, stride, 8);
-    gl.enableVertexAttribArray(this.lineLoc.aAlpha);
-    gl.vertexAttribPointer(this.lineLoc.aAlpha, 1, gl.FLOAT, false, stride, 20);
-    gl.uniform2f(this.lineLoc.uResolution, w, h);
-    gl.lineWidth(1);
-    gl.drawArrays(gl.LINES, 0, vertCount);
-
-    // Pass 3: grab the frame we just rendered as "previous" for next
-    // frame's fade -- a raw pixel copy off the default framebuffer, no
-    // shader/draw call at all (cheaper than the textured blit this
-    // replaced).
-    gl.bindTexture(gl.TEXTURE_2D, this.prevTex);
-    gl.copyTexImage2D(gl.TEXTURE_2D, 0, gl.RGB, 0, 0, w, h, 0);
+    this.accumIdx = writeIdx;
   }
 }
 
